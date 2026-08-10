@@ -1,0 +1,30 @@
+# Local secrets
+instagram_telegram_bot.env
+.env
+*.env
+!*.env.example
+
+# Cookies / credentials
+*cookies*.txt
+*.cookies
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Downloads / temp
+downloads/
+tmp/
+*.mp4
+*.jpg
+*.jpeg
+*.png
+*.webp
