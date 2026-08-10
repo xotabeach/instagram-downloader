@@ -133,7 +133,7 @@ class InstagramDownloaderApp:
         )
         title.pack(anchor="w", pady=(0, 12))
 
-        url_label = ttk.Label(main, text="Ссылка на Instagram:")
+        url_label = ttk.Label(main, text="Ссылка на Instagram / TikTok:")
         url_label.pack(anchor="w")
 
         self.url_entry = ttk.Entry(main, textvariable=self.url_var, font=("Arial", 12))
@@ -280,13 +280,13 @@ class InstagramDownloaderApp:
         output_dir = self.output_dir_var.get().strip()
 
         if not url:
-            messagebox.showerror("Ошибка", "Вставь ссылку на Instagram.")
+            messagebox.showerror("Ошибка", "Вставь ссылку на Instagram или TikTok.")
             return
 
-        if "instagram.com" not in url:
+        if "instagram.com" not in url and "tiktok.com" not in url:
             messagebox.showwarning(
                 "Проверка ссылки",
-                "Ссылка не похожа на Instagram URL, но я всё равно попробую скачать."
+                "Ссылка не похожа на Instagram/TikTok URL, но я всё равно попробую скачать."
             )
 
         if not output_dir:

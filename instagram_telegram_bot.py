@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import tempfile
 import traceback
@@ -16,13 +17,14 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 from instagram_core import (
     download_instagram_media,
-    extract_instagram_url,
+    extract_media_url,
     is_image,
     is_video,
 )
 
 # Telegram Bot API limit for regular bots is 50 MB.
 MAX_UPLOAD_BYTES = 49 * 1024 * 1024
+AUTH_STORE_PATH = Path(__file__).with_name("authorized_users.json")
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -32,38 +34,119 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def load_allowed_user_ids() -> set[int] | None:
-    raw = os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").strip()
-    if not raw:
-        return None
-    return {int(part.strip()) for part in raw.split(",") if part.strip()}
-
-
-ALLOWED_USER_IDS = load_allowed_user_ids()
 COOKIES_BROWSER = os.getenv("INSTAGRAM_COOKIES_FROM_BROWSER", "").strip() or None
 COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "").strip() or None
 SEND_PREVIEW = env_bool("TELEGRAM_SEND_PREVIEW", True)
 SEND_DOCUMENT = env_bool("TELEGRAM_SEND_DOCUMENT", True)
+AUTH_QUESTION = (
+    os.getenv("TELEGRAM_AUTH_QUESTION", "").strip()
+    or "Как зовут автора бота?"
+)
+AUTH_ANSWER = (
+    os.getenv("TELEGRAM_AUTH_ANSWER", "").strip().lower().lstrip("@")
+    or "xotabeach"
+)
+
+# Users who already saw the question and are waiting for the answer (in-memory).
+_pending_auth: set[int] = set()
 
 
-def user_allowed(user_id: int | None) -> bool:
-    if ALLOWED_USER_IDS is None:
+def load_authorized_user_ids() -> set[int]:
+    if not AUTH_STORE_PATH.exists():
+        return set()
+    try:
+        data = json.loads(AUTH_STORE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {int(item) for item in data}
+
+
+def save_authorized_user_ids(user_ids: set[int]) -> None:
+    AUTH_STORE_PATH.write_text(
+        json.dumps(sorted(user_ids), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+AUTHORIZED_USER_IDS = load_authorized_user_ids()
+
+
+def normalize_answer(text: str) -> str:
+    return text.strip().lower().lstrip("@")
+
+
+def is_authorized(user_id: int | None) -> bool:
+    return user_id is not None and user_id in AUTHORIZED_USER_IDS
+
+
+def authorize_user(user_id: int) -> None:
+    AUTHORIZED_USER_IDS.add(user_id)
+    _pending_auth.discard(user_id)
+    save_authorized_user_ids(AUTHORIZED_USER_IDS)
+
+
+async def ask_auth_question(message) -> None:
+    await message.reply_text(
+        "Чтобы пользоваться ботом, ответь на вопрос:\n"
+        f"{AUTH_QUESTION}"
+    )
+
+
+async def ensure_authorized(update: Update) -> bool:
+    """Return True if user may use the bot. Ask the secret question only once."""
+    message = update.message
+    user = update.effective_user
+    if not message or not user:
+        return False
+
+    if is_authorized(user.id):
         return True
-    return user_id is not None and user_id in ALLOWED_USER_IDS
+
+    text = (message.text or "").strip()
+    if text.startswith("/"):
+        # /start and /help should only show the question, not treat as answer.
+        if user.id not in _pending_auth:
+            _pending_auth.add(user.id)
+            await ask_auth_question(message)
+        else:
+            await message.reply_text(f"Жду ответ на вопрос:\n{AUTH_QUESTION}")
+        return False
+
+    if normalize_answer(text) == AUTH_ANSWER:
+        authorize_user(user.id)
+        await message.reply_text(
+            "Ок, доступ открыт.\n"
+            "Пришли ссылку на Instagram или TikTok."
+        )
+        return False
+
+    if user.id not in _pending_auth:
+        _pending_auth.add(user.id)
+        await ask_auth_question(message)
+        return False
+
+    await message.reply_text("Неверный ответ. Попробуй ещё раз.")
+    return False
+
+
+def welcome_text() -> str:
+    return (
+        "Пришли ссылку на Instagram или TikTok.\n"
+        "Я скачаю и отправлю медиа как есть:\n"
+        "• видео — файлом без сжатия Telegram\n"
+        "• фото — фото\n"
+        "• карусель — каждый элемент отдельно"
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.effective_user or not user_allowed(update.effective_user.id):
-        if update.message:
-            await update.message.reply_text("Доступ запрещён.")
+    if not update.message:
         return
-
-    await update.message.reply_text(
-        "Пришли ссылку на Instagram (post / reel / video / photo).\n"
-        "Я скачаю и отправлю:\n"
-        "• обычный вариант (фото/видео в ленте)\n"
-        "• оригинал файлом без сжатия Telegram"
-    )
+    if not await ensure_authorized(update):
+        return
+    await update.message.reply_text(welcome_text())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -81,23 +164,43 @@ async def send_media_pair(message, file_path: Path) -> None:
 
     caption = file_path.name
 
+    # One message per item:
+    # - video → document (без сжатия Telegram), либо video если document выключен
+    # - photo → photo
     with file_path.open("rb") as media_file:
-        if SEND_PREVIEW:
-            if is_image(file_path):
-                await message.reply_photo(photo=media_file, caption=f"Превью: {caption}")
-            elif is_video(file_path):
-                await message.reply_video(video=media_file, caption=f"Превью: {caption}")
+        if is_video(file_path):
+            if SEND_DOCUMENT:
+                await message.reply_document(
+                    document=media_file,
+                    filename=file_path.name,
+                    caption=caption,
+                )
+            elif SEND_PREVIEW:
+                await message.reply_video(video=media_file, caption=caption)
             else:
-                await message.reply_document(document=media_file, caption=caption)
-                return
+                await message.reply_document(
+                    document=media_file,
+                    filename=file_path.name,
+                    caption=caption,
+                )
+            return
 
-    if SEND_DOCUMENT:
-        with file_path.open("rb") as document_file:
-            await message.reply_document(
-                document=document_file,
-                filename=file_path.name,
-                caption=f"Оригинал (без сжатия): {caption}",
-            )
+        if is_image(file_path):
+            if SEND_PREVIEW or not SEND_DOCUMENT:
+                await message.reply_photo(photo=media_file, caption=caption)
+            else:
+                await message.reply_document(
+                    document=media_file,
+                    filename=file_path.name,
+                    caption=caption,
+                )
+            return
+
+        await message.reply_document(
+            document=media_file,
+            filename=file_path.name,
+            caption=caption,
+        )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -105,13 +208,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not message or not message.text:
         return
 
-    if not update.effective_user or not user_allowed(update.effective_user.id):
-        await message.reply_text("Доступ запрещён.")
+    if not await ensure_authorized(update):
         return
 
-    url = extract_instagram_url(message.text)
+    url = extract_media_url(message.text)
     if not url:
-        await message.reply_text("Не вижу ссылку Instagram. Пришли URL вида https://www.instagram.com/...")
+        await message.reply_text(
+            "Не вижу ссылку Instagram/TikTok.\n"
+            "Пришли URL вида:\n"
+            "• https://www.instagram.com/...\n"
+            "• https://www.tiktok.com/... или https://vm.tiktok.com/..."
+        )
         return
 
     status = await message.reply_text("Скачиваю...")
@@ -170,7 +277,7 @@ def main() -> None:
             "Пример:\n"
             'export TELEGRAM_BOT_TOKEN="123:ABC"\n'
             'export INSTAGRAM_COOKIES_FROM_BROWSER="chrome"\n'
-            'export TELEGRAM_ALLOWED_USER_IDS="123456789"\n'
+            'export TELEGRAM_AUTH_ANSWER="xotabeach"\n'
             "python3 instagram_telegram_bot.py"
         )
 
@@ -185,7 +292,8 @@ def main() -> None:
     print("Instagram Telegram bot started.")
     print(f"Cookies browser: {COOKIES_BROWSER or 'нет'}")
     print(f"Cookies file: {COOKIES_FILE or 'нет'}")
-    print(f"Allowed users: {sorted(ALLOWED_USER_IDS) if ALLOWED_USER_IDS else 'все'}")
+    print(f"Auth question: {AUTH_QUESTION}")
+    print(f"Authorized users: {len(AUTHORIZED_USER_IDS)}")
     print(f"Send preview: {SEND_PREVIEW}, send document: {SEND_DOCUMENT}")
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)

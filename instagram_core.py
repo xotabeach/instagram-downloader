@@ -93,6 +93,10 @@ def get_shortcode_from_url(url: str) -> str:
     return "instagram"
 
 
+def _clean_extracted_url(url: str) -> str:
+    return url.rstrip(").,]}>\"'")
+
+
 def extract_instagram_url(text: str) -> str | None:
     match = re.search(
         r"https?://(?:www\.)?instagram\.com/[^\s<>\"']+",
@@ -101,7 +105,30 @@ def extract_instagram_url(text: str) -> str | None:
     )
     if not match:
         return None
-    return match.group(0).rstrip(").,]}>\"'")
+    return _clean_extracted_url(match.group(0))
+
+
+def extract_tiktok_url(text: str) -> str | None:
+    match = re.search(
+        r"https?://(?:(?:www|m|vm|vt)\.)?tiktok\.com/[^\s<>\"']+",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return _clean_extracted_url(match.group(0))
+
+
+def extract_media_url(text: str) -> str | None:
+    return extract_instagram_url(text) or extract_tiktok_url(text)
+
+
+def is_instagram_url(url: str) -> bool:
+    return "instagram.com" in url.lower()
+
+
+def is_tiktok_url(url: str) -> bool:
+    return "tiktok.com" in url.lower()
 
 
 def get_media_files(output_path: Path) -> set[Path]:
@@ -118,6 +145,63 @@ def is_image(path: Path) -> bool:
 
 def is_video(path: Path) -> bool:
     return path.suffix.lower() in VIDEO_EXTENSIONS
+
+
+def filter_video_thumbnails(files: list[Path]) -> list[Path]:
+    """Drop still images that are covers/thumbnails for already downloaded videos."""
+    videos = [path for path in files if is_video(path)]
+    images = [path for path in files if is_image(path)]
+    if not videos or not images:
+        return files
+
+    video_stems = {path.stem.lower() for path in videos}
+    # yt-dlp names: <date>_<id>_<title>.mp4 — drop matching <date>_<id>_*.jpg
+    video_id_prefixes: set[str] = set()
+    for path in videos:
+        parts = path.stem.split("_")
+        if len(parts) >= 2:
+            video_id_prefixes.add("_".join(parts[:2]).lower())
+
+    kept: list[Path] = []
+    for path in files:
+        if not is_image(path):
+            kept.append(path)
+            continue
+
+        stem = path.stem.lower()
+        if stem in video_stems:
+            continue
+        if any(stem == prefix or stem.startswith(prefix + "_") for prefix in video_id_prefixes):
+            continue
+        kept.append(path)
+
+    return kept
+
+
+def instagram_photo_fallback_mode(
+    result_code: int,
+    files_after_ydl: list[Path],
+) -> str | None:
+    """
+    Decide whether Instagram photo fallback is needed.
+
+    Returns:
+      - None: do not fetch photos (e.g. pure video already downloaded)
+      - "gallery_only": mixed carousel — fetch real photos, skip page scrape
+      - "full": photo post / total miss — gallery-dl then page scrape
+    """
+    has_video = any(is_video(path) for path in files_after_ydl)
+    has_image = any(is_image(path) for path in files_after_ydl)
+
+    if result_code == 0 and (has_video or has_image):
+        return None
+    if not files_after_ydl:
+        return "full"
+    if has_video and not has_image:
+        return "gallery_only"
+    if not has_video:
+        return "full"
+    return None
 
 
 def build_ydl_options(
@@ -253,7 +337,10 @@ def download_photos_with_gallery_dl(
         "--no-colors",
         "--no-check-certificate",
         "--filter",
-        "extension in ('jpg', 'jpeg', 'png', 'webp')",
+        (
+            "extension in ('jpg', 'jpeg', 'png', 'webp') and "
+            "typename == 'GraphImage'"
+        ),
         "-D",
         str(output_path),
         "-f",
@@ -405,6 +492,7 @@ def format_download_error(error_text: str) -> list[str]:
             [
                 "1. Проверь ссылку и доступность поста.",
                 "2. Для Instagram обычно нужны cookies.",
+                "3. Для TikTok обычно cookies не нужны — проверь, что видео публичное.",
             ]
         )
 
@@ -429,10 +517,16 @@ def download_instagram_media(
     output_path = Path(output_path).expanduser().resolve()
     output_path.mkdir(parents=True, exist_ok=True)
 
+    # Instagram cookies are only useful for Instagram; for TikTok they often
+    # just trigger browser/keychain errors and are not needed.
+    use_cookies = is_instagram_url(url)
+    effective_cookies_browser = cookies_browser if use_cookies else None
+    effective_cookies_file = cookies_file if use_cookies else None
+
     emit(f"Ссылка: {url}")
     emit(f"Папка: {output_path}")
-    emit(f"Cookies browser: {cookies_browser or 'нет'}")
-    emit(f"Cookies file: {cookies_file or 'нет'}")
+    emit(f"Cookies browser: {effective_cookies_browser or 'нет'}")
+    emit(f"Cookies file: {effective_cookies_file or 'нет'}")
 
     existing_mp4_files = set(output_path.glob("*.mp4"))
     existing_media_files = get_media_files(output_path)
@@ -440,8 +534,8 @@ def download_instagram_media(
     try:
         options = build_ydl_options(
             output_path,
-            cookies_browser=cookies_browser,
-            cookies_file=cookies_file,
+            cookies_browser=effective_cookies_browser,
+            cookies_file=effective_cookies_file,
             log=emit,
         )
 
@@ -450,35 +544,46 @@ def download_instagram_media(
 
         make_new_mp4_files_quicktime_friendly(output_path, existing_mp4_files, emit)
 
-        gallery_result_code = 1
-        if "instagram.com" in url:
-            if cookies_file or (cookies_browser and cookies_browser != "Без cookies"):
-                gallery_result_code = download_photos_with_gallery_dl(
-                    url,
-                    output_path,
-                    cookies_browser=cookies_browser,
-                    cookies_file=cookies_file,
-                    log=emit,
-                )
-                if gallery_result_code == 0:
-                    emit("Фото из карусели обработаны.")
-                else:
-                    emit("gallery-dl не смог скачать фото, пробую запасной публичный способ.")
+        files_after_ydl = sorted(get_media_files(output_path) - existing_media_files)
 
-            if gallery_result_code != 0:
-                try:
-                    photo_count = download_instagram_photos(url, output_path, emit)
-                    if photo_count:
-                        emit(f"Фото сохранено: {photo_count}")
-                except Exception as photo_error:
-                    emit(f"Не удалось скачать фото из страницы Instagram: {photo_error}")
+        if is_instagram_url(url):
+            photo_mode = instagram_photo_fallback_mode(result_code, files_after_ydl)
+            if photo_mode:
+                gallery_result_code = 1
+                if effective_cookies_file or (
+                    effective_cookies_browser and effective_cookies_browser != "Без cookies"
+                ):
+                    gallery_result_code = download_photos_with_gallery_dl(
+                        url,
+                        output_path,
+                        cookies_browser=effective_cookies_browser,
+                        cookies_file=effective_cookies_file,
+                        log=emit,
+                    )
+                    if gallery_result_code == 0:
+                        emit("Фото из карусели обработаны.")
+                    else:
+                        emit("gallery-dl не смог скачать фото.")
 
-        new_files = sorted(get_media_files(output_path) - existing_media_files)
+                # Page scrape pulls video posters/covers — only for pure photo posts.
+                if photo_mode == "full" and gallery_result_code != 0:
+                    try:
+                        photo_count = download_instagram_photos(url, output_path, emit)
+                        if photo_count:
+                            emit(f"Фото сохранено: {photo_count}")
+                    except Exception as photo_error:
+                        emit(f"Не удалось скачать фото из страницы Instagram: {photo_error}")
+            else:
+                emit("Фото-fallback пропущен: видео уже скачано без пропусков.")
+
+        new_files = filter_video_thumbnails(
+            sorted(get_media_files(output_path) - existing_media_files)
+        )
         partial = bool(result_code) and bool(new_files)
 
         if not new_files:
-            if "instagram.com" in url and not cookies_file and (
-                not cookies_browser or cookies_browser == "Без cookies"
+            if is_instagram_url(url) and not effective_cookies_file and (
+                not effective_cookies_browser or effective_cookies_browser == "Без cookies"
             ):
                 emit("Instagram не отдал медиа без авторизации. Нужны cookies.")
             return DownloadResult(

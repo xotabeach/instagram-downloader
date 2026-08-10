@@ -21,9 +21,10 @@ if [[ -z "$TELEGRAM_BOT_TOKEN" ]]; then
   echo "Содержимое:"
   echo 'TELEGRAM_BOT_TOKEN=123456:ABC'
   echo 'INSTAGRAM_COOKIES_FROM_BROWSER=chrome'
-  echo 'TELEGRAM_ALLOWED_USER_IDS=ТВОЙ_TELEGRAM_ID'
+  echo 'TELEGRAM_AUTH_QUESTION=Как зовут автора бота?'
+  echo 'TELEGRAM_AUTH_ANSWER=xotabeach'
   echo
-  echo "Токен берётся у @BotFather. Свой id удобно узнать у @userinfobot."
+  echo "Токен берётся у @BotFather."
   read -k 1 "?Нажми любую клавишу..."
   exit 1
 fi
