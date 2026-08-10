@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import tempfile
 import traceback
 from pathlib import Path
@@ -25,6 +26,7 @@ from instagram_core import (
 # Telegram Bot API limit for regular bots is 50 MB.
 MAX_UPLOAD_BYTES = 49 * 1024 * 1024
 AUTH_STORE_PATH = Path(__file__).with_name("authorized_users.json")
+JOKES_PATH = Path(__file__).with_name("category_b_jokes.json")
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -32,6 +34,18 @@ def env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_category_b_jokes() -> list[str]:
+    if not JOKES_PATH.exists():
+        return []
+    try:
+        data = json.loads(JOKES_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [str(item).strip() for item in data if str(item).strip()]
 
 
 COOKIES_BROWSER = os.getenv("INSTAGRAM_COOKIES_FROM_BROWSER", "").strip() or None
@@ -46,6 +60,7 @@ AUTH_ANSWER = (
     os.getenv("TELEGRAM_AUTH_ANSWER", "").strip().lower().lstrip("@")
     or "xotabeach"
 )
+CATEGORY_B_JOKES = load_category_b_jokes()
 
 # Users who already saw the question and are waiting for the answer (in-memory).
 _pending_auth: set[int] = set()
@@ -137,7 +152,8 @@ def welcome_text() -> str:
         "Я скачаю и отправлю:\n"
         "• видео — превью + оригинал файлом без сжатия\n"
         "• фото — фото\n"
-        "• карусель — каждый элемент отдельно"
+        "• карусель — каждый элемент отдельно\n"
+        "После видео — случайный анекдот категории Б."
     )
 
 
@@ -162,21 +178,18 @@ async def send_media_pair(message, file_path: Path) -> None:
         )
         return
 
-    caption = file_path.name
-
-    # Video: optional in-chat preview + original as a real file (no Telegram recompression).
-    # Photo: just a photo (no extra poster/thumbnail spam).
+    # Video: preview + original file, no captions/tags.
+    # Photo: just a photo.
     if is_video(file_path):
         if SEND_PREVIEW:
             with file_path.open("rb") as media_file:
-                await message.reply_video(video=media_file, caption=f"Превью: {caption}")
+                await message.reply_video(video=media_file)
 
         if SEND_DOCUMENT or not SEND_PREVIEW:
             with file_path.open("rb") as document_file:
                 await message.reply_document(
                     document=document_file,
                     filename=file_path.name,
-                    caption=f"Оригинал (файл без сжатия): {caption}",
                     disable_content_type_detection=True,
                 )
         return
@@ -184,12 +197,11 @@ async def send_media_pair(message, file_path: Path) -> None:
     if is_image(file_path):
         with file_path.open("rb") as media_file:
             if SEND_PREVIEW or not SEND_DOCUMENT:
-                await message.reply_photo(photo=media_file, caption=caption)
+                await message.reply_photo(photo=media_file)
             else:
                 await message.reply_document(
                     document=media_file,
                     filename=file_path.name,
-                    caption=caption,
                     disable_content_type_detection=True,
                 )
         return
@@ -198,9 +210,14 @@ async def send_media_pair(message, file_path: Path) -> None:
         await message.reply_document(
             document=media_file,
             filename=file_path.name,
-            caption=caption,
             disable_content_type_detection=True,
         )
+
+
+async def send_random_category_b_joke(message) -> None:
+    if not CATEGORY_B_JOKES:
+        return
+    await message.reply_text(random.choice(CATEGORY_B_JOKES))
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -242,11 +259,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
         await status.edit_text(f"Скачано файлов: {len(result.files)}. Отправляю...")
 
+        sent_video = False
         for file_path in result.files:
             try:
                 await send_media_pair(message, file_path)
+                if is_video(file_path):
+                    sent_video = True
             except TelegramError as send_error:
                 await message.reply_text(f"Не отправил {file_path.name}: {send_error}")
+
+        if sent_video:
+            try:
+                await send_random_category_b_joke(message)
+            except TelegramError:
+                pass
 
         note = "Готово."
         if result.partial:
@@ -294,6 +320,7 @@ def main() -> None:
     print(f"Cookies file: {COOKIES_FILE or 'нет'}")
     print(f"Auth question: {AUTH_QUESTION}")
     print(f"Authorized users: {len(AUTHORIZED_USER_IDS)}")
+    print(f"Category B jokes: {len(CATEGORY_B_JOKES)}")
     print(f"Send preview: {SEND_PREVIEW}, send document: {SEND_DOCUMENT}")
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
