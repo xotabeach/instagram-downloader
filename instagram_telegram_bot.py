@@ -134,8 +134,8 @@ async def ensure_authorized(update: Update) -> bool:
 def welcome_text() -> str:
     return (
         "Пришли ссылку на Instagram или TikTok.\n"
-        "Я скачаю и отправлю медиа как есть:\n"
-        "• видео — файлом без сжатия Telegram\n"
+        "Я скачаю и отправлю:\n"
+        "• видео — превью + оригинал файлом без сжатия\n"
         "• фото — фото\n"
         "• карусель — каждый элемент отдельно"
     )
@@ -164,28 +164,25 @@ async def send_media_pair(message, file_path: Path) -> None:
 
     caption = file_path.name
 
-    # One message per item:
-    # - video → document (без сжатия Telegram), либо video если document выключен
-    # - photo → photo
-    with file_path.open("rb") as media_file:
-        if is_video(file_path):
-            if SEND_DOCUMENT:
-                await message.reply_document(
-                    document=media_file,
-                    filename=file_path.name,
-                    caption=caption,
-                )
-            elif SEND_PREVIEW:
-                await message.reply_video(video=media_file, caption=caption)
-            else:
-                await message.reply_document(
-                    document=media_file,
-                    filename=file_path.name,
-                    caption=caption,
-                )
-            return
+    # Video: optional in-chat preview + original as a real file (no Telegram recompression).
+    # Photo: just a photo (no extra poster/thumbnail spam).
+    if is_video(file_path):
+        if SEND_PREVIEW:
+            with file_path.open("rb") as media_file:
+                await message.reply_video(video=media_file, caption=f"Превью: {caption}")
 
-        if is_image(file_path):
+        if SEND_DOCUMENT or not SEND_PREVIEW:
+            with file_path.open("rb") as document_file:
+                await message.reply_document(
+                    document=document_file,
+                    filename=file_path.name,
+                    caption=f"Оригинал (файл без сжатия): {caption}",
+                    disable_content_type_detection=True,
+                )
+        return
+
+    if is_image(file_path):
+        with file_path.open("rb") as media_file:
             if SEND_PREVIEW or not SEND_DOCUMENT:
                 await message.reply_photo(photo=media_file, caption=caption)
             else:
@@ -193,13 +190,16 @@ async def send_media_pair(message, file_path: Path) -> None:
                     document=media_file,
                     filename=file_path.name,
                     caption=caption,
+                    disable_content_type_detection=True,
                 )
-            return
+        return
 
+    with file_path.open("rb") as media_file:
         await message.reply_document(
             document=media_file,
             filename=file_path.name,
             caption=caption,
+            disable_content_type_detection=True,
         )
 
 
