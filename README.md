@@ -63,11 +63,12 @@ cp instagram_telegram_bot.env.example instagram_telegram_bot.env
 
 ```env
 TELEGRAM_BOT_TOKEN=123456:ABC
-INSTAGRAM_COOKIES_FROM_BROWSER=chrome
 TELEGRAM_AUTH_QUESTION=Как зовут автора бота?
 TELEGRAM_AUTH_ANSWER=xotabeach
 TELEGRAM_SEND_PREVIEW=true
 TELEGRAM_SEND_DOCUMENT=true
+# Если Instagram требует логин — только файл cookies, без чтения браузера:
+# INSTAGRAM_COOKIES_FILE=/path/to/instagram_cookies.txt
 ```
 
 4. Запуск:
@@ -100,8 +101,8 @@ TELEGRAM_SEND_DOCUMENT=true
 | Переменная | Зачем |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | токен от BotFather |
-| `INSTAGRAM_COOKIES_FROM_BROWSER` | `chrome` / `safari` / … — cookies для Instagram |
-| `INSTAGRAM_COOKIES_FILE` | альтернатива: путь к `cookies.txt` |
+| `INSTAGRAM_COOKIES_FROM_BROWSER` | лучше **не использовать** на macOS (Keychain-попапы) |
+| `INSTAGRAM_COOKIES_FILE` | безопасный вариант: путь к `cookies.txt` |
 | `TELEGRAM_AUTH_QUESTION` | вопрос при первом входе |
 | `TELEGRAM_AUTH_ANSWER` | ответ (регистр и `@` не важны) |
 | `TELEGRAM_SEND_PREVIEW` | слать превью видео/фото |
@@ -128,11 +129,13 @@ Instagram Telegram Bot.command
 
 ## Cookies и macOS
 
-Instagram часто требует авторизацию. Типичные грабли на Mac:
+По умолчанию бот **не** читает cookies из браузера — иначе macOS на каждое скачивание спрашивает доступ к Keychain / диску.
 
-1. **Полный доступ к диску** для Terminal / Python — иначе cookies браузера не читаются  
-2. Запрос доступа к **Связке ключей** при первом чтении Chrome cookies  
-3. Если браузер упирается — экспортируй `cookies.txt` и укажи `INSTAGRAM_COOKIES_FILE`
+Если Instagram не отдаёт пост без логина:
+
+1. Экспортируй `cookies.txt` расширением вроде «Get cookies.txt LOCALLY»
+2. Укажи путь в `INSTAGRAM_COOKIES_FILE`
+3. Не включай `INSTAGRAM_COOKIES_FROM_BROWSER`
 
 TikTok обычно **cookies не требует**.
 

@@ -302,13 +302,21 @@ def main() -> None:
             "Не задан TELEGRAM_BOT_TOKEN.\n"
             "Пример:\n"
             'export TELEGRAM_BOT_TOKEN="123:ABC"\n'
-            'export INSTAGRAM_COOKIES_FROM_BROWSER="chrome"\n'
             'export TELEGRAM_AUTH_ANSWER="xotabeach"\n'
             "python3 instagram_telegram_bot.py"
         )
 
     if COOKIES_FILE and not Path(COOKIES_FILE).expanduser().exists():
-        raise SystemExit(f"Файл cookies не найден: {COOKIES_FILE}")
+        raise SystemExit(
+            f"Файл cookies не найден: {COOKIES_FILE}\n\n"
+            "Для фото Instagram нужен cookies.txt:\n"
+            "1) Зайди в Instagram в Chrome\n"
+            "2) Расширением «Get cookies.txt LOCALLY» экспортируй cookies\n"
+            f"3) Сохрани файл сюда: {COOKIES_FILE}\n"
+            "4) Запусти бота снова\n\n"
+            "Либо временно убери INSTAGRAM_COOKIES_FILE из .env "
+            "(тогда сработают в основном только видео/TikTok)."
+        )
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))

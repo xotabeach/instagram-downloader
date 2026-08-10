@@ -134,7 +134,7 @@ def is_tiktok_url(url: str) -> bool:
 def get_media_files(output_path: Path) -> set[Path]:
     return {
         file_path
-        for file_path in output_path.glob("*")
+        for file_path in output_path.rglob("*")
         if file_path.is_file() and file_path.suffix.lower() in MEDIA_EXTENSIONS
     }
 
@@ -338,13 +338,14 @@ def download_photos_with_gallery_dl(
         "--no-check-certificate",
         "--filter",
         (
-            "extension in ('jpg', 'jpeg', 'png', 'webp') and "
-            "typename == 'GraphImage'"
+            # Modern Instagram metadata often has no GraphQL `typename`.
+            # Keep still images only; skip video covers (`video_url` set).
+            "extension in ('jpg', 'jpeg', 'png', 'webp') and not video_url"
         ),
         "-D",
         str(output_path),
         "-f",
-        "{date:%Y%m%d}_{media_id}.{extension}",
+        "{date:%Y%m%d}_{media_id}_{num}.{extension}",
         url,
     ]
 
@@ -550,6 +551,7 @@ def download_instagram_media(
             photo_mode = instagram_photo_fallback_mode(result_code, files_after_ydl)
             if photo_mode:
                 gallery_result_code = 1
+                files_before_gallery = set(get_media_files(output_path))
                 if effective_cookies_file or (
                     effective_cookies_browser and effective_cookies_browser != "Без cookies"
                 ):
@@ -560,9 +562,15 @@ def download_instagram_media(
                         cookies_file=effective_cookies_file,
                         log=emit,
                     )
-                    if gallery_result_code == 0:
-                        emit("Фото из карусели обработаны.")
+                    gallery_images = [
+                        path
+                        for path in (get_media_files(output_path) - files_before_gallery)
+                        if is_image(path)
+                    ]
+                    if gallery_result_code == 0 and gallery_images:
+                        emit(f"Фото из карусели обработаны: {len(gallery_images)}")
                     else:
+                        gallery_result_code = 1
                         emit("gallery-dl не смог скачать фото.")
 
                 # Page scrape pulls video posters/covers — only for pure photo posts.
@@ -580,12 +588,27 @@ def download_instagram_media(
             sorted(get_media_files(output_path) - existing_media_files)
         )
         partial = bool(result_code) and bool(new_files)
+        # yt-dlp exits non-zero on photo-only posts even when photos downloaded fine.
+        if partial and is_instagram_url(url) and new_files and all(is_image(path) for path in new_files):
+            partial = False
 
         if not new_files:
             if is_instagram_url(url) and not effective_cookies_file and (
                 not effective_cookies_browser or effective_cookies_browser == "Без cookies"
             ):
-                emit("Instagram не отдал медиа без авторизации. Нужны cookies.")
+                emit(
+                    "Это фото или карусель Instagram — без cookies их почти не отдают.\n"
+                    "Сделай один раз cookies.txt (без чтения браузера каждый раз):\n"
+                    "1) В Chrome зайди в Instagram под своим аккаунтом\n"
+                    "2) Расширение «Get cookies.txt LOCALLY» → Export → сохранить файл\n"
+                    "3) Положи как instagram_cookies.txt рядом с ботом\n"
+                    "4) В .env укажи INSTAGRAM_COOKIES_FILE=.../instagram_cookies.txt и перезапусти бота"
+                )
+            elif is_instagram_url(url):
+                emit(
+                    "Не удалось скачать даже с cookies. "
+                    "Проверь, что пост открывается в браузере под этим аккаунтом и cookies не протухли."
+                )
             return DownloadResult(
                 files=[],
                 messages=messages,

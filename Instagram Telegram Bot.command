@@ -20,11 +20,12 @@ if [[ -z "$TELEGRAM_BOT_TOKEN" ]]; then
   echo
   echo "Содержимое:"
   echo 'TELEGRAM_BOT_TOKEN=123456:ABC'
-  echo 'INSTAGRAM_COOKIES_FROM_BROWSER=chrome'
+  echo '# INSTAGRAM_COOKIES_FILE=/path/to/instagram_cookies.txt'
   echo 'TELEGRAM_AUTH_QUESTION=Как зовут автора бота?'
   echo 'TELEGRAM_AUTH_ANSWER=xotabeach'
   echo
   echo "Токен берётся у @BotFather."
+  echo "Cookies из браузера лучше не включать — macOS будет спрашивать доступ к Keychain."
   read -k 1 "?Нажми любую клавишу..."
   exit 1
 fi
