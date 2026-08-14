@@ -33,6 +33,11 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 
+YOUTUBE_QUALITY_HEIGHTS = (1080, 720, 480, 360)
+YOUTUBE_MAX_DURATION_SECONDS = 20 * 60
+TELEGRAM_MAX_UPLOAD_BYTES = 49 * 1024 * 1024
+COMPRESS_TARGET_BYTES = 45 * 1024 * 1024
+
 LogFn = Callable[[str], None]
 
 
@@ -119,16 +124,36 @@ def extract_tiktok_url(text: str) -> str | None:
     return _clean_extracted_url(match.group(0))
 
 
+def extract_youtube_url(text: str) -> str | None:
+    match = re.search(
+        r"https?://(?:(?:www|m|music)\.)?(?:youtube\.com|youtu\.be)/[^\s<>\"']+",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    return _clean_extracted_url(match.group(0))
+
+
 def extract_media_url(text: str) -> str | None:
-    return extract_instagram_url(text) or extract_tiktok_url(text)
+    return (
+        extract_instagram_url(text)
+        or extract_tiktok_url(text)
+        or extract_youtube_url(text)
+    )
 
 
 def is_instagram_url(url: str) -> bool:
-    return "instagram.com" in url.lower()
+    return "instagram.com" in urlparse(url).netloc.lower()
 
 
 def is_tiktok_url(url: str) -> bool:
-    return "tiktok.com" in url.lower()
+    return "tiktok.com" in urlparse(url).netloc.lower()
+
+
+def is_youtube_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return host == "youtu.be" or host.endswith(".youtu.be") or "youtube.com" in host
 
 
 def get_media_files(output_path: Path) -> set[Path]:
@@ -204,6 +229,34 @@ def instagram_photo_fallback_mode(
     return None
 
 
+def format_selector_for_height(max_height: int | None) -> str:
+    if max_height is None:
+        return "bestvideo+bestaudio/best"
+    return (
+        f"bv*[height<={max_height}]+ba/"
+        f"b[height<={max_height}]/"
+        "bv*+ba/b"
+    )
+
+
+def youtube_qualities_from_formats(formats: list[dict]) -> list[int]:
+    max_height = 0
+    for item in formats:
+        height = item.get("height")
+        if isinstance(height, int) and height > max_height:
+            max_height = height
+    if max_height <= 0:
+        return list(YOUTUBE_QUALITY_HEIGHTS)
+    qualities = [height for height in YOUTUBE_QUALITY_HEIGHTS if height <= max_height]
+    if qualities:
+        return qualities
+    return [YOUTUBE_QUALITY_HEIGHTS[-1]]
+
+
+def format_mb(size: int) -> str:
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
 def build_ydl_options(
     output_path: Path,
     *,
@@ -211,16 +264,18 @@ def build_ydl_options(
     cookies_file: str | Path | None = None,
     log: LogFn = _noop_log,
     progress_hook: Callable[[dict], None] | None = None,
+    max_height: int | None = None,
+    noplaylist: bool = False,
 ) -> dict:
     ffmpeg_path = get_ffmpeg_path()
 
     options = {
         "outtmpl": str(output_path / "%(upload_date|unknown)s_%(id)s_%(title).80s.%(ext)s"),
         # Prefer the best source streams. ffmpeg only remuxes them into MP4;
-        # it must not rescale or re-encode the video.
-        "format": "bestvideo+bestaudio/best",
+        # it must not rescale or re-encode the video unless the user asked.
+        "format": format_selector_for_height(max_height),
         "merge_output_format": "mp4",
-        "noplaylist": False,
+        "noplaylist": noplaylist,
         "ignoreerrors": True,
         "retries": 5,
         "fragment_retries": 5,
@@ -434,6 +489,154 @@ def probe_video_metadata(file_path: Path) -> VideoMetadata:
     return VideoMetadata(width=width, height=height, duration=duration)
 
 
+@dataclass
+class YoutubeInfo:
+    title: str = ""
+    duration: int | None = None
+    qualities: list[int] = field(default_factory=lambda: list(YOUTUBE_QUALITY_HEIGHTS))
+    error: str | None = None
+
+
+def inspect_youtube_video(url: str, log: LogFn = _noop_log) -> YoutubeInfo:
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "extract_flat": False,
+        "logger": ListLogger(log),
+    }
+    ffmpeg_path = get_ffmpeg_path()
+    if ffmpeg_path:
+        options["ffmpeg_location"] = ffmpeg_path
+
+    try:
+        with YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except DownloadError as error:
+        return YoutubeInfo(error=str(error))
+    except Exception as error:
+        return YoutubeInfo(error=str(error))
+
+    if not info:
+        return YoutubeInfo(error="Не удалось получить данные YouTube.")
+
+    if info.get("_type") == "playlist":
+        entries = [entry for entry in (info.get("entries") or []) if entry]
+        if not entries:
+            return YoutubeInfo(error="Плейлист пуст.")
+        info = entries[0]
+
+    duration = info.get("duration")
+    duration_seconds = int(duration) if isinstance(duration, (int, float)) else None
+    if duration_seconds and duration_seconds > YOUTUBE_MAX_DURATION_SECONDS:
+        minutes = duration_seconds // 60
+        return YoutubeInfo(
+            title=str(info.get("title") or ""),
+            duration=duration_seconds,
+            error=f"Ролик слишком длинный ({minutes} мин). Максимум 20 минут.",
+        )
+
+    return YoutubeInfo(
+        title=str(info.get("title") or ""),
+        duration=duration_seconds,
+        qualities=youtube_qualities_from_formats(info.get("formats") or []),
+    )
+
+
+def compress_video_for_telegram(
+    file_path: Path,
+    *,
+    max_bytes: int = TELEGRAM_MAX_UPLOAD_BYTES,
+    log: LogFn = _noop_log,
+) -> Path:
+    """Re-encode to fit Telegram's upload limit, keeping the original aspect ratio."""
+    ffmpeg_path = get_ffmpeg_path()
+    if not ffmpeg_path:
+        raise RuntimeError("ffmpeg не найден, не могу сжать видео.")
+
+    metadata = probe_video_metadata(file_path)
+    duration = max(metadata.duration or 1, 1)
+    original_height = metadata.height
+    target_bytes = min(max_bytes, COMPRESS_TARGET_BYTES)
+    audio_bps = 96_000
+    video_bps = max(int(target_bytes * 8 * 0.90 / duration) - audio_bps, 120_000)
+
+    heights: list[int | None] = [None]
+    for height in (720, 480, 360):
+        if original_height and original_height > height:
+            heights.append(height)
+
+    temp_path = file_path.with_name(file_path.stem + ".tg.mp4")
+    last_error = "неизвестная ошибка"
+
+    for height in heights:
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-threads",
+            "1",
+            "-i",
+            str(file_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-b:v",
+            str(video_bps),
+            "-maxrate",
+            str(video_bps),
+            "-bufsize",
+            str(video_bps * 2),
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+        ]
+        if height is not None:
+            command.extend(["-vf", f"scale=-2:{height}"])
+            log(f"Сжимаю с понижением до {height}p...")
+        else:
+            log("Сжимаю, сохраняя исходное разрешение...")
+
+        command.append(str(temp_path))
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if result.returncode:
+            last_error = (result.stdout or "")[-1000:]
+            log(f"ffmpeg не смог сжать: {last_error}")
+            if temp_path.exists():
+                temp_path.unlink()
+            continue
+
+        size = temp_path.stat().st_size
+        log(f"Сжатый файл: {format_mb(size)}")
+        if size <= max_bytes:
+            file_path.unlink()
+            temp_path.replace(file_path)
+            return file_path
+
+        video_bps = max(int(video_bps * 0.75), 80_000)
+
+    if temp_path.exists():
+        temp_path.unlink()
+    raise RuntimeError(f"Не удалось ужать видео до {format_mb(max_bytes)}: {last_error}")
+
+
 def format_download_error(error_text: str) -> list[str]:
     tips = ["Что проверить:"]
 
@@ -470,7 +673,7 @@ def format_download_error(error_text: str) -> list[str]:
             [
                 "1. Проверь ссылку и доступность поста.",
                 "2. Для Instagram обычно нужны cookies.",
-                "3. Для TikTok обычно cookies не нужны — проверь, что видео публичное.",
+                "3. Для TikTok и YouTube cookies обычно не нужны — проверь, что видео публичное.",
             ]
         )
 
@@ -484,6 +687,7 @@ def download_instagram_media(
     cookies_browser: str | None = None,
     cookies_file: str | Path | None = None,
     log: LogFn | None = None,
+    max_height: int | None = None,
 ) -> DownloadResult:
     messages: list[str] = []
 
@@ -514,6 +718,8 @@ def download_instagram_media(
             cookies_browser=effective_cookies_browser,
             cookies_file=effective_cookies_file,
             log=emit,
+            max_height=max_height,
+            noplaylist=is_youtube_url(url),
         )
 
         with YoutubeDL(options) as ydl:

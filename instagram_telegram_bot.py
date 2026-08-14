@@ -1,5 +1,5 @@
 #!/Library/Frameworks/Python.framework/Versions/3.14/bin/python3
-"""Telegram bot: send Instagram URL → get preview media + original file."""
+"""Telegram bot: send Instagram/TikTok/YouTube URL → get playable media."""
 
 from __future__ import annotations
 
@@ -7,25 +7,41 @@ import asyncio
 import json
 import os
 import random
+import secrets
+import shutil
 import tempfile
+import time
 import traceback
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from instagram_core import (
+    TELEGRAM_MAX_UPLOAD_BYTES,
+    compress_video_for_telegram,
     download_instagram_media,
     extract_media_url,
+    format_mb,
+    inspect_youtube_video,
     is_image,
     is_video,
+    is_youtube_url,
     probe_video_metadata,
 )
 
-# Telegram Bot API limit for regular bots is 50 MB.
-MAX_UPLOAD_BYTES = 49 * 1024 * 1024
+MAX_UPLOAD_BYTES = TELEGRAM_MAX_UPLOAD_BYTES
+JOB_TTL_SECONDS = 15 * 60
 AUTH_STORE_PATH = Path(__file__).with_name("authorized_users.json")
 JOKES_PATH = Path(__file__).with_name("category_b_jokes.json")
 
@@ -65,6 +81,20 @@ CATEGORY_B_JOKES = load_category_b_jokes()
 
 # Users who already saw the question and are waiting for the answer (in-memory).
 _pending_auth: set[int] = set()
+_pending_jobs: dict[str, "PendingJob"] = {}
+_heavy_lock = asyncio.Lock()
+
+
+@dataclass
+class PendingJob:
+    kind: str
+    user_id: int
+    url: str
+    created: float
+    workdir: Path | None = None
+    oversized: list[Path] = field(default_factory=list)
+    sent_video: bool = False
+    partial: bool = False
 
 
 def load_authorized_user_ids() -> set[int]:
@@ -112,13 +142,21 @@ async def ask_auth_question(message) -> None:
 
 async def ensure_authorized(update: Update) -> bool:
     """Return True if user may use the bot. Ask the secret question only once."""
+    query = update.callback_query
     message = update.message
     user = update.effective_user
-    if not message or not user:
+    if not user:
         return False
 
     if is_authorized(user.id):
         return True
+
+    if query:
+        await query.answer("Сначала напиши /start и ответь на вопрос.", show_alert=True)
+        return False
+
+    if not message:
+        return False
 
     text = (message.text or "").strip()
     if text.startswith("/"):
@@ -134,7 +172,7 @@ async def ensure_authorized(update: Update) -> bool:
         authorize_user(user.id)
         await message.reply_text(
             "Ок, доступ открыт.\n"
-            "Пришли ссылку на Instagram или TikTok."
+            "Пришли ссылку на Instagram, TikTok или YouTube."
         )
         return False
 
@@ -149,9 +187,11 @@ async def ensure_authorized(update: Update) -> bool:
 
 def welcome_text() -> str:
     return (
-        "Пришли ссылку на Instagram или TikTok.\n"
+        "Пришли ссылку на Instagram, TikTok или YouTube.\n"
         "Я скачаю и отправлю медиа как есть:\n"
+        "• YouTube — выбор качества (1080p/720p/480p/360p), до 20 минут\n"
         "• видео — в исходном разрешении и соотношении сторон\n"
+        "• если файл больше ~50 MB — предложу сжать\n"
         "• фото — фото\n"
         "• карусель — каждый элемент отдельно\n"
         "После видео — случайный анекдот категории Б."
@@ -229,79 +269,295 @@ async def send_random_category_b_joke(message) -> None:
     await message.reply_text(random.choice(CATEGORY_B_JOKES))
 
 
+def cleanup_workdir(path: Path | None) -> None:
+    if not path:
+        return
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def purge_expired_jobs() -> None:
+    now = time.monotonic()
+    for job_id, job in list(_pending_jobs.items()):
+        if now - job.created > JOB_TTL_SECONDS:
+            cleanup_workdir(job.workdir)
+            _pending_jobs.pop(job_id, None)
+
+
+def cancel_user_jobs(user_id: int) -> None:
+    for job_id, job in list(_pending_jobs.items()):
+        if job.user_id == user_id:
+            cleanup_workdir(job.workdir)
+            _pending_jobs.pop(job_id, None)
+
+
+def quality_keyboard(job_id: str, qualities: list[int]) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(f"{height}p", callback_data=f"q:{job_id}:{height}")
+        for height in qualities
+    ]
+    rows = [buttons[index : index + 2] for index in range(0, len(buttons), 2)]
+    rows.append([InlineKeyboardButton("Отмена", callback_data=f"x:{job_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def compress_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Сжать до 50 MB", callback_data=f"c:{job_id}"),
+                InlineKeyboardButton("Отмена", callback_data=f"x:{job_id}"),
+            ]
+        ]
+    )
+
+
+async def offer_compress(status, job_id: str, file_path: Path) -> None:
+    await status.edit_text(
+        f"Файл слишком большой для Telegram ({format_mb(file_path.stat().st_size)}).\n"
+        "Лимит ~50 MB. Можно немного сжать — пропорции сохранятся.",
+        reply_markup=compress_keyboard(job_id),
+    )
+
+
+async def finish_delivery(reply_target, status, sent_video: bool, partial: bool, workdir: Path | None) -> None:
+    if sent_video:
+        try:
+            await send_random_category_b_joke(reply_target)
+        except TelegramError:
+            pass
+    note = "Готово частично: часть элементов могла не скачаться." if partial else "Готово."
+    await status.edit_text(note)
+    cleanup_workdir(workdir)
+
+
+async def deliver_or_offer(
+    reply_target,
+    status,
+    *,
+    user_id: int,
+    url: str,
+    workdir: Path,
+    files: list[Path],
+    partial: bool,
+    sent_video: bool = False,
+) -> None:
+    oversized: list[Path] = []
+    for file_path in files:
+        if is_video(file_path) and file_path.stat().st_size > MAX_UPLOAD_BYTES:
+            oversized.append(file_path)
+            continue
+        try:
+            await send_media(reply_target, file_path)
+            if is_video(file_path):
+                sent_video = True
+        except TelegramError as send_error:
+            await reply_target.reply_text(f"Не отправил {file_path.name}: {send_error}")
+
+    if oversized:
+        job_id = secrets.token_hex(8)
+        _pending_jobs[job_id] = PendingJob(
+            kind="compress",
+            user_id=user_id,
+            url=url,
+            created=time.monotonic(),
+            workdir=workdir,
+            oversized=oversized,
+            sent_video=sent_video,
+            partial=partial,
+        )
+        await offer_compress(status, job_id, oversized[0])
+        return
+
+    await finish_delivery(reply_target, status, sent_video, partial, workdir)
+
+
+async def run_download(
+    reply_target,
+    status,
+    *,
+    user_id: int,
+    url: str,
+    max_height: int | None = None,
+) -> None:
+    workdir = Path(tempfile.mkdtemp(prefix="ig_tg_"))
+    try:
+        if _heavy_lock.locked():
+            await status.edit_text("Подожди, обрабатывается другое видео...")
+        async with _heavy_lock:
+            await reply_target.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
+            result = await asyncio.to_thread(
+                download_instagram_media,
+                url,
+                workdir,
+                cookies_browser=COOKIES_BROWSER,
+                cookies_file=COOKIES_FILE,
+                max_height=max_height,
+            )
+
+        if not result.files:
+            details = "\n".join(result.messages[-8:]) if result.messages else (result.error or "unknown")
+            await status.edit_text(f"Не удалось скачать.\n\n{details}")
+            cleanup_workdir(workdir)
+            return
+
+        await status.edit_text(f"Скачано файлов: {len(result.files)}. Отправляю...")
+        await deliver_or_offer(
+            reply_target,
+            status,
+            user_id=user_id,
+            url=url,
+            workdir=workdir,
+            files=result.files,
+            partial=result.partial,
+        )
+    except Exception:
+        cleanup_workdir(workdir)
+        raise
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
-    if not message or not message.text:
+    user = update.effective_user
+    if not message or not message.text or not user:
         return
 
     if not await ensure_authorized(update):
         return
 
+    purge_expired_jobs()
     url = extract_media_url(message.text)
     if not url:
         await message.reply_text(
-            "Не вижу ссылку Instagram/TikTok.\n"
+            "Не вижу ссылку Instagram/TikTok/YouTube.\n"
             "Пришли URL вида:\n"
             "• https://www.instagram.com/...\n"
-            "• https://www.tiktok.com/... или https://vm.tiktok.com/..."
+            "• https://www.tiktok.com/... или https://vm.tiktok.com/...\n"
+            "• https://youtu.be/... или https://www.youtube.com/watch?v=..."
+        )
+        return
+
+    cancel_user_jobs(user.id)
+
+    if is_youtube_url(url):
+        status = await message.reply_text("Смотрю ролик...")
+        info = await asyncio.to_thread(inspect_youtube_video, url)
+        if info.error:
+            await status.edit_text(info.error)
+            return
+        job_id = secrets.token_hex(8)
+        _pending_jobs[job_id] = PendingJob(
+            kind="quality",
+            user_id=user.id,
+            url=url,
+            created=time.monotonic(),
+        )
+        title = (info.title or "YouTube").strip()[:80]
+        duration = ""
+        if info.duration:
+            duration = f" · {info.duration // 60} мин {info.duration % 60:02d} с"
+        await status.edit_text(
+            f"{title}{duration}\nВыбери качество:",
+            reply_markup=quality_keyboard(job_id, info.qualities),
         )
         return
 
     status = await message.reply_text("Скачиваю...")
-    await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-
-    workdir = Path(tempfile.mkdtemp(prefix="ig_tg_"))
-
     try:
-        result = await asyncio.to_thread(
-            download_instagram_media,
-            url,
-            workdir,
-            cookies_browser=COOKIES_BROWSER,
-            cookies_file=COOKIES_FILE,
-        )
-
-        if not result.files:
-            details = "\n".join(result.messages[-8:]) if result.messages else (result.error or "unknown")
-            await status.edit_text(f"Не удалось скачать.\n\n{details}")
-            return
-
-        await status.edit_text(f"Скачано файлов: {len(result.files)}. Отправляю...")
-
-        sent_video = False
-        for file_path in result.files:
-            try:
-                await send_media(message, file_path)
-                if is_video(file_path):
-                    sent_video = True
-            except TelegramError as send_error:
-                await message.reply_text(f"Не отправил {file_path.name}: {send_error}")
-
-        if sent_video:
-            try:
-                await send_random_category_b_joke(message)
-            except TelegramError:
-                pass
-
-        note = "Готово."
-        if result.partial:
-            note = "Готово частично: часть элементов могла не скачаться."
-        await status.edit_text(note)
-
-    except Exception as e:
-        await status.edit_text(f"Ошибка: {e}")
+        await run_download(message, status, user_id=user.id, url=url)
+    except Exception as error:
+        await status.edit_text(f"Ошибка: {error}")
         traceback.print_exc()
 
-    finally:
-        for file_path in workdir.glob("*"):
-            try:
-                file_path.unlink()
-            except OSError:
-                pass
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not user:
+        return
+
+    if not await ensure_authorized(update):
+        return
+
+    await query.answer()
+    purge_expired_jobs()
+
+    data = query.data or ""
+    parts = data.split(":")
+    if len(parts) < 2:
+        await query.edit_message_text("Эта кнопка уже не действует.")
+        return
+
+    action, job_id = parts[0], parts[1]
+    job = _pending_jobs.get(job_id)
+    if not job or job.user_id != user.id:
+        await query.edit_message_text("Эта кнопка уже не действует.")
+        return
+
+    status = query.message
+    if not status:
+        return
+
+    if action == "x":
+        cleanup_workdir(job.workdir)
+        _pending_jobs.pop(job_id, None)
+        await status.edit_text("Отменено.")
+        return
+
+    if action == "q" and job.kind == "quality":
+        if len(parts) < 3 or not parts[2].isdigit():
+            await status.edit_text("Неизвестное качество.")
+            return
+        height = int(parts[2])
+        _pending_jobs.pop(job_id, None)
+        await status.edit_text(f"Скачиваю {height}p...")
         try:
-            workdir.rmdir()
-        except OSError:
-            pass
+            await run_download(
+                status,
+                status,
+                user_id=user.id,
+                url=job.url,
+                max_height=height,
+            )
+        except Exception as error:
+            await status.edit_text(f"Ошибка: {error}")
+            traceback.print_exc()
+        return
+
+    if action == "c" and job.kind == "compress":
+        if not job.oversized:
+            _pending_jobs.pop(job_id, None)
+            await status.edit_text("Файл уже обработан.")
+            return
+        source = job.oversized[0]
+        await status.edit_text("Сжимаю до ~50 MB...")
+        try:
+            if _heavy_lock.locked():
+                await status.edit_text("Подожди, обрабатывается другое видео...")
+            async with _heavy_lock:
+                compressed = await asyncio.to_thread(compress_video_for_telegram, source)
+        except Exception as error:
+            await status.edit_text(f"Не удалось сжать: {error}")
+            cleanup_workdir(job.workdir)
+            _pending_jobs.pop(job_id, None)
+            traceback.print_exc()
+            return
+
+        job.oversized.pop(0)
+        try:
+            await send_media(status, compressed)
+            job.sent_video = True
+        except TelegramError as send_error:
+            await status.reply_text(f"Не отправил {compressed.name}: {send_error}")
+
+        if job.oversized:
+            await offer_compress(status, job_id, job.oversized[0])
+            return
+
+        _pending_jobs.pop(job_id, None)
+        await finish_delivery(status, status, job.sent_video, job.partial, job.workdir)
+        return
+
+    await status.edit_text("Эта кнопка уже не действует.")
 
 
 def main() -> None:
@@ -330,6 +586,7 @@ def main() -> None:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     print("Instagram Telegram bot started.")
