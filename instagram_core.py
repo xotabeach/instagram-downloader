@@ -375,6 +375,65 @@ def download_photos_with_gallery_dl(
     return process.wait()
 
 
+@dataclass
+class VideoMetadata:
+    width: int | None = None
+    height: int | None = None
+    duration: int | None = None
+
+
+_VIDEO_STREAM_RE = re.compile(r"Video:.*?,\s(\d{2,5})x(\d{2,5})")
+_DISPLAY_ASPECT_RE = re.compile(r"DAR (\d+):(\d+)")
+_DURATION_RE = re.compile(r"Duration: (\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
+_DISPLAY_MATRIX_ROTATION_RE = re.compile(r"rotation of (-?\d+(?:\.\d+)?) degrees")
+_ROTATE_TAG_RE = re.compile(r"rotate\s*:\s*(-?\d+)")
+
+
+def probe_video_metadata(file_path: Path) -> VideoMetadata:
+    """Read display size and duration so players keep the original aspect ratio."""
+    ffmpeg_path = get_ffmpeg_path()
+    if not ffmpeg_path:
+        return VideoMetadata()
+
+    result = subprocess.run(
+        [ffmpeg_path, "-hide_banner", "-i", str(file_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    output = result.stdout
+
+    size_match = _VIDEO_STREAM_RE.search(output)
+    if not size_match:
+        return VideoMetadata()
+
+    width = int(size_match.group(1))
+    height = int(size_match.group(2))
+
+    # Anamorphic sources (non-square pixels) are stored squeezed; without the
+    # display size Telegram renders them with the wrong aspect ratio.
+    aspect_match = _DISPLAY_ASPECT_RE.search(output)
+    if aspect_match:
+        aspect_width = int(aspect_match.group(1))
+        aspect_height = int(aspect_match.group(2))
+        if aspect_width > 0 and aspect_height > 0:
+            width = round(height * aspect_width / aspect_height)
+
+    rotation_match = _DISPLAY_MATRIX_ROTATION_RE.search(output) or _ROTATE_TAG_RE.search(output)
+    if rotation_match and round(abs(float(rotation_match.group(1)))) % 180 == 90:
+        width, height = height, width
+
+    duration = None
+    duration_match = _DURATION_RE.search(output)
+    if duration_match:
+        hours = int(duration_match.group(1))
+        minutes = int(duration_match.group(2))
+        seconds = float(duration_match.group(3))
+        duration = round(hours * 3600 + minutes * 60 + seconds)
+
+    return VideoMetadata(width=width, height=height, duration=duration)
+
+
 def format_download_error(error_text: str) -> list[str]:
     tips = ["Что проверить:"]
 

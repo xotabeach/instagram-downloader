@@ -21,6 +21,7 @@ from instagram_core import (
     extract_media_url,
     is_image,
     is_video,
+    probe_video_metadata,
 )
 
 # Telegram Bot API limit for regular bots is 50 MB.
@@ -50,8 +51,8 @@ def load_category_b_jokes() -> list[str]:
 
 COOKIES_BROWSER = os.getenv("INSTAGRAM_COOKIES_FROM_BROWSER", "").strip() or None
 COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "").strip() or None
-SEND_PREVIEW = env_bool("TELEGRAM_SEND_PREVIEW", False)
-SEND_DOCUMENT = env_bool("TELEGRAM_SEND_DOCUMENT", True)
+SEND_PREVIEW = env_bool("TELEGRAM_SEND_PREVIEW", True)
+SEND_DOCUMENT = env_bool("TELEGRAM_SEND_DOCUMENT", False)
 AUTH_QUESTION = (
     os.getenv("TELEGRAM_AUTH_QUESTION", "").strip()
     or "Как зовут автора бота?"
@@ -150,7 +151,7 @@ def welcome_text() -> str:
     return (
         "Пришли ссылку на Instagram или TikTok.\n"
         "Я скачаю и отправлю медиа как есть:\n"
-        "• видео — оригинал файлом без сжатия\n"
+        "• видео — в исходном разрешении и соотношении сторон\n"
         "• фото — фото\n"
         "• карусель — каждый элемент отдельно\n"
         "После видео — случайный анекдот категории Б."
@@ -178,20 +179,28 @@ async def send_media(message, file_path: Path) -> None:
         )
         return
 
-    # A document preserves the source file and avoids uploading the same video
-    # twice. Preview mode is only a fallback when document delivery is disabled.
+    # Video plays right in the chat; explicit display size keeps the original
+    # aspect ratio. The extra document copy is opt-in because it uploads twice.
     # Photo: just a photo.
     if is_video(file_path):
-        if SEND_DOCUMENT or not SEND_PREVIEW:
+        if SEND_PREVIEW or not SEND_DOCUMENT:
+            metadata = await asyncio.to_thread(probe_video_metadata, file_path)
+            with file_path.open("rb") as media_file:
+                await message.reply_video(
+                    video=media_file,
+                    width=metadata.width,
+                    height=metadata.height,
+                    duration=metadata.duration,
+                    supports_streaming=True,
+                )
+
+        if SEND_DOCUMENT:
             with file_path.open("rb") as document_file:
                 await message.reply_document(
                     document=document_file,
                     filename=file_path.name,
                     disable_content_type_detection=True,
                 )
-        else:
-            with file_path.open("rb") as media_file:
-                await message.reply_video(video=media_file, supports_streaming=True)
         return
 
     if is_image(file_path):
