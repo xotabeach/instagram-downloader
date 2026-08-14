@@ -39,11 +39,18 @@ YOUTUBE_QUALITY_HEIGHTS = (1080, 720, 480, 360)
 YOUTUBE_MAX_DURATION_SECONDS = 20 * 60
 TELEGRAM_MAX_UPLOAD_BYTES = 49 * 1024 * 1024
 COMPRESS_TARGET_BYTES = 45 * 1024 * 1024
-COMPRESS_TIMEOUT_SECONDS = 15 * 60
+COMPRESS_TIMEOUT_SECONDS = 10 * 60
+COMPRESS_TIMEOUT_CAP_SECONDS = 25 * 60
+# Throughput measured on the deploy VPS (one shared Broadwell core, ~50% steal):
+# decoding 1080p60 runs at 0.8x realtime, encoding 480p30 at 1.6x.
+COMPRESS_DECODE_PIXELS_PER_SECOND = 124_000_000 / 0.8
+COMPRESS_ENCODE_PIXELS_PER_SECOND = 12_400_000 / 1.6
 # Bitrate below which a resolution stops looking good. Re-encoding 1080p at
 # 1.5 Mbps wastes a lot of CPU on pixels the bitrate cannot carry anyway, and on
 # a one-core VPS that difference is tens of minutes.
-COMPRESS_HEIGHT_BITRATE = ((1080, 3_500_000), (720, 1_600_000), (480, 800_000), (360, 0))
+COMPRESS_HEIGHT_BITRATE = ((1080, 3_500_000), (720, 2_000_000), (480, 1_000_000), (360, 0))
+# 60 fps doubles the encoding work and buys nothing at a compressed bitrate.
+COMPRESS_MAX_FPS = 30
 # android_vr has the full quality ladder but YouTube sometimes 403s its
 # media URLs. web_embedded is more stable; tv is last-resort (often 360p).
 YOUTUBE_PLAYER_CLIENT_ATTEMPTS = (
@@ -470,9 +477,11 @@ class VideoMetadata:
     width: int | None = None
     height: int | None = None
     duration: int | None = None
+    fps: float | None = None
 
 
 _VIDEO_STREAM_RE = re.compile(r"Video:.*?,\s(\d{2,5})x(\d{2,5})")
+_FPS_RE = re.compile(r",\s(\d+(?:\.\d+)?)\sfps")
 _DISPLAY_ASPECT_RE = re.compile(r"DAR (\d+):(\d+)")
 _DURATION_RE = re.compile(r"Duration: (\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
 _DISPLAY_MATRIX_ROTATION_RE = re.compile(r"rotation of (-?\d+(?:\.\d+)?) degrees")
@@ -521,7 +530,12 @@ def probe_video_metadata(file_path: Path) -> VideoMetadata:
         seconds = float(duration_match.group(3))
         duration = round(hours * 3600 + minutes * 60 + seconds)
 
-    return VideoMetadata(width=width, height=height, duration=duration)
+    fps = None
+    fps_match = _FPS_RE.search(output)
+    if fps_match:
+        fps = float(fps_match.group(1))
+
+    return VideoMetadata(width=width, height=height, duration=duration, fps=fps)
 
 
 @dataclass
@@ -609,6 +623,36 @@ def compress_height_ladder(original_height: int | None, video_bps: int) -> list[
     return ladder or [None]
 
 
+def compress_video_bitrate(duration: int, max_bytes: int) -> int:
+    target_bytes = min(max_bytes, COMPRESS_TARGET_BYTES)
+    return max(int(target_bytes * 8 * 0.90 / max(duration, 1)) - 96_000, 120_000)
+
+
+def estimate_compress_seconds(metadata: VideoMetadata, height: int | None) -> int:
+    """Rough wall clock for one encode pass, used for the ETA and the timeout."""
+    duration = max(metadata.duration or 1, 1)
+    source_fps = min(metadata.fps or 30, 120)
+    source_pps = (metadata.width or 1280) * (metadata.height or 720) * source_fps
+
+    output_height = height or metadata.height or 720
+    output_pps = output_height * output_height * 16 / 9 * min(source_fps, COMPRESS_MAX_FPS)
+
+    decode = source_pps / COMPRESS_DECODE_PIXELS_PER_SECOND
+    encode = output_pps / COMPRESS_ENCODE_PIXELS_PER_SECOND
+    return int(duration * (decode + encode))
+
+
+def estimate_compress_for_file(
+    file_path: Path,
+    *,
+    max_bytes: int = TELEGRAM_MAX_UPLOAD_BYTES,
+) -> int:
+    metadata = probe_video_metadata(file_path)
+    video_bps = compress_video_bitrate(metadata.duration or 1, max_bytes)
+    height = compress_height_ladder(metadata.height, video_bps)[0]
+    return estimate_compress_seconds(metadata, height)
+
+
 class CompressTimeout(RuntimeError):
     pass
 
@@ -667,15 +711,19 @@ def compress_video_for_telegram(
 
     metadata = probe_video_metadata(file_path)
     duration = max(metadata.duration or 1, 1)
-    target_bytes = min(max_bytes, COMPRESS_TARGET_BYTES)
-    audio_bps = 96_000
-    video_bps = max(int(target_bytes * 8 * 0.90 / duration) - audio_bps, 120_000)
+    video_bps = compress_video_bitrate(duration, max_bytes)
+    ladder = compress_height_ladder(metadata.height, video_bps)
 
+    # A slow box needs more than the default budget; the cap still stops runaways.
+    budget = min(
+        max(timeout_seconds, estimate_compress_seconds(metadata, ladder[0]) * 2),
+        COMPRESS_TIMEOUT_CAP_SECONDS,
+    )
     temp_path = file_path.with_name(file_path.stem + ".tg.mp4")
-    deadline = time.monotonic() + timeout_seconds
+    deadline = time.monotonic() + budget
     last_error = "неизвестная ошибка"
 
-    for height in compress_height_ladder(metadata.height, video_bps):
+    for height in ladder:
         command = [
             ffmpeg_path,
             "-y",
@@ -696,7 +744,7 @@ def compress_video_for_telegram(
             "-c:v",
             "libx264",
             "-preset",
-            "veryfast",
+            "superfast",
             # A short lookahead keeps x264 well under the service memory limit;
             # going over it makes the cgroup throttle the encode to a crawl.
             "-x264-params",
@@ -718,11 +766,16 @@ def compress_video_for_telegram(
             "-movflags",
             "+faststart",
         ]
+        filters = []
         if height is not None:
-            command.extend(["-vf", f"scale=-2:{height}"])
-            log(f"Сжимаю с понижением до {height}p...")
-        else:
-            log("Сжимаю, сохраняя исходное разрешение...")
+            filters.append(f"scale=-2:{height}")
+        if metadata.fps and metadata.fps > COMPRESS_MAX_FPS:
+            filters.append(f"fps={COMPRESS_MAX_FPS}")
+        if filters:
+            command.extend(["-vf", ",".join(filters)])
+
+        target = f"{height}p" if height is not None else "исходное разрешение"
+        log(f"Сжимаю: {target}, {video_bps // 1000} kbps...")
 
         command.append(str(temp_path))
         try:
@@ -735,7 +788,7 @@ def compress_video_for_telegram(
         except CompressTimeout:
             if temp_path.exists():
                 temp_path.unlink()
-            minutes = timeout_seconds // 60
+            minutes = budget // 60
             raise RuntimeError(
                 f"Сжатие не уложилось в {minutes} мин — ролик слишком тяжёлый "
                 "для этого сервера. Скачай его в меньшем качестве."

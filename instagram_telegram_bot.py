@@ -32,6 +32,7 @@ from instagram_core import (
     YOUTUBE_QUALITY_HEIGHTS,
     compress_video_for_telegram,
     download_instagram_media,
+    estimate_compress_for_file,
     extract_media_url,
     format_mb,
     inspect_youtube_video,
@@ -328,15 +329,14 @@ def lower_qualities_for(job: "PendingJob") -> list[int]:
 
 async def offer_compress(status, job_id: str, job: "PendingJob") -> None:
     file_path = job.oversized[0]
-    hint = (
-        "Сжатие займёт несколько минут."
-        if not lower_qualities_for(job)
-        else "Сжатие займёт несколько минут — перекачать в меньшем качестве быстрее."
-    )
+    lower = lower_qualities_for(job)
+    estimate = await asyncio.to_thread(estimate_compress_for_file, file_path)
+    hint = f"Сжатие займёт ~{max(estimate // 60, 1)} мин"
+    hint += " — перекачать в меньшем качестве быстрее." if lower else "."
     await status.edit_text(
         f"Файл слишком большой для Telegram ({format_mb(file_path.stat().st_size)}).\n"
         f"Лимит ~50 MB. {hint}",
-        reply_markup=compress_keyboard(job_id, lower_qualities_for(job)),
+        reply_markup=compress_keyboard(job_id, lower),
     )
 
 
