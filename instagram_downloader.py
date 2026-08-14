@@ -462,7 +462,7 @@ class InstagramDownloaderApp:
             "--cookies-from-browser",
             selected_browser,
             "--filter",
-            "extension in ('jpg', 'jpeg', 'png', 'webp')",
+            "extension in ('jpg', 'jpeg', 'png', 'webp', 'heic', 'heif') and not video_url",
             "-D",
             str(output_path),
             "-f",

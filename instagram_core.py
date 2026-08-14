@@ -216,7 +216,9 @@ def build_ydl_options(
 
     options = {
         "outtmpl": str(output_path / "%(upload_date|unknown)s_%(id)s_%(title).80s.%(ext)s"),
-        "format": "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/b[vcodec^=avc1]/bv*+ba/b",
+        # Prefer the best source streams. ffmpeg only remuxes them into MP4;
+        # it must not rescale or re-encode the video.
+        "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
         "noplaylist": False,
         "ignoreerrors": True,
@@ -340,7 +342,8 @@ def download_photos_with_gallery_dl(
         (
             # Modern Instagram metadata often has no GraphQL `typename`.
             # Keep still images only; skip video covers (`video_url` set).
-            "extension in ('jpg', 'jpeg', 'png', 'webp') and not video_url"
+            # Source may be HEIC even when CDN delivers a JPEG (`stp=dst-jpg`).
+            "extension in ('jpg', 'jpeg', 'png', 'webp', 'heic', 'heif') and not video_url"
         ),
         "-D",
         str(output_path),
@@ -370,91 +373,6 @@ def download_photos_with_gallery_dl(
                 log(line)
 
     return process.wait()
-
-
-def is_quicktime_friendly_mp4(file_path: Path) -> bool:
-    ffmpeg_path = get_ffmpeg_path()
-    if not ffmpeg_path:
-        return True
-
-    result = subprocess.run(
-        [ffmpeg_path, "-hide_banner", "-i", str(file_path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    output = result.stdout.lower()
-
-    has_h264_video = "video: h264" in output
-    has_audio = "audio:" in output
-    has_aac_audio = "audio: aac" in output
-
-    return has_h264_video and (not has_audio or has_aac_audio)
-
-
-def make_mp4_quicktime_friendly(file_path: Path, log: LogFn = _noop_log) -> None:
-    ffmpeg_path = get_ffmpeg_path()
-    if not ffmpeg_path:
-        log("ffmpeg не найден, не могу перекодировать MP4 для QuickTime.")
-        return
-
-    if is_quicktime_friendly_mp4(file_path):
-        return
-
-    temp_path = file_path.with_name(file_path.stem + ".quicktime.mp4")
-    log(f"Перекодирую для QuickTime: {file_path.name}")
-
-    command = [
-        ffmpeg_path,
-        "-y",
-        "-i",
-        str(file_path),
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "fast",
-        "-crf",
-        "20",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "160k",
-        "-movflags",
-        "+faststart",
-        str(temp_path),
-    ]
-
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-
-    if result.returncode:
-        log(f"Не удалось перекодировать {file_path.name}: {result.stdout[-1000:]}")
-        if temp_path.exists():
-            temp_path.unlink()
-        return
-
-    temp_path.replace(file_path)
-    log(f"MP4 готов для QuickTime: {file_path}")
-
-
-def make_new_mp4_files_quicktime_friendly(
-    output_path: Path,
-    existing_files: set[Path],
-    log: LogFn = _noop_log,
-) -> None:
-    for file_path in sorted(output_path.glob("*.mp4")):
-        if file_path not in existing_files:
-            make_mp4_quicktime_friendly(file_path, log)
 
 
 def format_download_error(error_text: str) -> list[str]:
@@ -529,7 +447,6 @@ def download_instagram_media(
     emit(f"Cookies browser: {effective_cookies_browser or 'нет'}")
     emit(f"Cookies file: {effective_cookies_file or 'нет'}")
 
-    existing_mp4_files = set(output_path.glob("*.mp4"))
     existing_media_files = get_media_files(output_path)
 
     try:
@@ -542,8 +459,6 @@ def download_instagram_media(
 
         with YoutubeDL(options) as ydl:
             result_code = ydl.download([url])
-
-        make_new_mp4_files_quicktime_friendly(output_path, existing_mp4_files, emit)
 
         files_after_ydl = sorted(get_media_files(output_path) - existing_media_files)
 

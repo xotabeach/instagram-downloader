@@ -50,7 +50,7 @@ def load_category_b_jokes() -> list[str]:
 
 COOKIES_BROWSER = os.getenv("INSTAGRAM_COOKIES_FROM_BROWSER", "").strip() or None
 COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "").strip() or None
-SEND_PREVIEW = env_bool("TELEGRAM_SEND_PREVIEW", True)
+SEND_PREVIEW = env_bool("TELEGRAM_SEND_PREVIEW", False)
 SEND_DOCUMENT = env_bool("TELEGRAM_SEND_DOCUMENT", True)
 AUTH_QUESTION = (
     os.getenv("TELEGRAM_AUTH_QUESTION", "").strip()
@@ -149,8 +149,8 @@ async def ensure_authorized(update: Update) -> bool:
 def welcome_text() -> str:
     return (
         "Пришли ссылку на Instagram или TikTok.\n"
-        "Я скачаю и отправлю:\n"
-        "• видео — превью + оригинал файлом без сжатия\n"
+        "Я скачаю и отправлю медиа как есть:\n"
+        "• видео — оригинал файлом без сжатия\n"
         "• фото — фото\n"
         "• карусель — каждый элемент отдельно\n"
         "После видео — случайный анекдот категории Б."
@@ -169,7 +169,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await start(update, context)
 
 
-async def send_media_pair(message, file_path: Path) -> None:
+async def send_media(message, file_path: Path) -> None:
     size = file_path.stat().st_size
     if size > MAX_UPLOAD_BYTES:
         await message.reply_text(
@@ -178,13 +178,10 @@ async def send_media_pair(message, file_path: Path) -> None:
         )
         return
 
-    # Video: preview + original file, no captions/tags.
+    # A document preserves the source file and avoids uploading the same video
+    # twice. Preview mode is only a fallback when document delivery is disabled.
     # Photo: just a photo.
     if is_video(file_path):
-        if SEND_PREVIEW:
-            with file_path.open("rb") as media_file:
-                await message.reply_video(video=media_file)
-
         if SEND_DOCUMENT or not SEND_PREVIEW:
             with file_path.open("rb") as document_file:
                 await message.reply_document(
@@ -192,6 +189,9 @@ async def send_media_pair(message, file_path: Path) -> None:
                     filename=file_path.name,
                     disable_content_type_detection=True,
                 )
+        else:
+            with file_path.open("rb") as media_file:
+                await message.reply_video(video=media_file, supports_streaming=True)
         return
 
     if is_image(file_path):
@@ -262,7 +262,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         sent_video = False
         for file_path in result.files:
             try:
-                await send_media_pair(message, file_path)
+                await send_media(message, file_path)
                 if is_video(file_path):
                     sent_video = True
             except TelegramError as send_error:

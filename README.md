@@ -5,7 +5,7 @@
 Два лица одной утилиты:
 
 - **GUI на macOS** — вставил ссылку, нажал «Скачать», файл лежит в `Downloads`
-- **Telegram-бот** — прислал Instagram или TikTok, получил превью + файл без сжатия Telegram
+- **Telegram-бот** — прислал Instagram или TikTok, получил исходный файл без сжатия Telegram
 
 Под капотом: `yt-dlp`, при необходимости `gallery-dl` и cookies браузера для капризных постов Instagram.
 
@@ -18,7 +18,7 @@
 | Видео / Reels | да | да |
 | Фото | да | — |
 | Карусель (фото + видео) | да, по элементам | — |
-| Превью в чате + оригинал файлом | в боте | в боте |
+| Оригинал файлом без сжатия | в боте | в боте |
 
 Бот после видео ещё кидает случайный **анекдот категории Б** — потому что скачивать в тишине скучно.
 
@@ -65,7 +65,7 @@ cp instagram_telegram_bot.env.example instagram_telegram_bot.env
 TELEGRAM_BOT_TOKEN=123456:ABC
 TELEGRAM_AUTH_QUESTION=Как зовут автора бота?
 TELEGRAM_AUTH_ANSWER=xotabeach
-TELEGRAM_SEND_PREVIEW=true
+TELEGRAM_SEND_PREVIEW=false
 TELEGRAM_SEND_DOCUMENT=true
 # Если Instagram требует логин — только файл cookies, без чтения браузера:
 # INSTAGRAM_COOKIES_FILE=/path/to/instagram_cookies.txt
@@ -84,9 +84,8 @@ TELEGRAM_SEND_DOCUMENT=true
 
 **Видео**
 
-1. Превью в ленте (удобно смотреть)
-2. Тот же ролик **документом** — без повторного сжатия Telegram
-3. Случайный анекдот категории Б
+1. Исходный ролик **документом** — без повторного сжатия Telegram
+2. Случайный анекдот категории Б
 
 **Фото** — просто фото, без лишних обложек и постеров.
 
@@ -105,7 +104,7 @@ TELEGRAM_SEND_DOCUMENT=true
 | `INSTAGRAM_COOKIES_FILE` | безопасный вариант: путь к `cookies.txt` |
 | `TELEGRAM_AUTH_QUESTION` | вопрос при первом входе |
 | `TELEGRAM_AUTH_ANSWER` | ответ (регистр и `@` не важны) |
-| `TELEGRAM_SEND_PREVIEW` | слать превью видео/фото |
+| `TELEGRAM_SEND_PREVIEW` | слать видео как превью, только если отправка документом выключена |
 | `TELEGRAM_SEND_DOCUMENT` | слать оригинал видео файлом |
 
 Авторизованные пользователи пишутся в локальный `authorized_users.json` (в git не попадает).  
@@ -138,6 +137,15 @@ Instagram Telegram Bot.command
 3. Не включай `INSTAGRAM_COOKIES_FROM_BROWSER`
 
 TikTok обычно **cookies не требует**.
+
+---
+
+## Деплой на сервер (Telegram-бот)
+
+Как заливать обновления, cookies, перезапускать systemd и смотреть логи — см. **[DEPLOY.md](DEPLOY.md)**.
+
+Кратко: код на `crimeatrip-test` в `/opt/instagram-downloader`, сервис `instagram-telegram-bot`.
+Работа по боту — в отдельном чате/репо; этот гайд как раз чтобы не держать всё в голове.
 
 ---
 
