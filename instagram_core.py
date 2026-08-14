@@ -8,6 +8,8 @@ import re
 import ssl
 import subprocess
 import sys
+import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -37,6 +39,11 @@ YOUTUBE_QUALITY_HEIGHTS = (1080, 720, 480, 360)
 YOUTUBE_MAX_DURATION_SECONDS = 20 * 60
 TELEGRAM_MAX_UPLOAD_BYTES = 49 * 1024 * 1024
 COMPRESS_TARGET_BYTES = 45 * 1024 * 1024
+COMPRESS_TIMEOUT_SECONDS = 15 * 60
+# Bitrate below which a resolution stops looking good. Re-encoding 1080p at
+# 1.5 Mbps wastes a lot of CPU on pixels the bitrate cannot carry anyway, and on
+# a one-core VPS that difference is tens of minutes.
+COMPRESS_HEIGHT_BITRATE = ((1080, 3_500_000), (720, 1_600_000), (480, 800_000), (360, 0))
 # android_vr has the full quality ladder but YouTube sometimes 403s its
 # media URLs. web_embedded is more stable; tv is last-resort (often 360p).
 YOUTUBE_PLAYER_CLIENT_ATTEMPTS = (
@@ -46,6 +53,7 @@ YOUTUBE_PLAYER_CLIENT_ATTEMPTS = (
 )
 
 LogFn = Callable[[str], None]
+ProgressFn = Callable[[float], None]
 
 
 def _noop_log(_: str) -> None:
@@ -584,11 +592,73 @@ def inspect_youtube_video(url: str, log: LogFn = _noop_log) -> YoutubeInfo:
     return YoutubeInfo(error=last_error or "Не удалось получить данные YouTube.")
 
 
+def compress_height_ladder(original_height: int | None, video_bps: int) -> list[int | None]:
+    """Resolutions to try, best affordable first. None means "keep the original"."""
+    cap = COMPRESS_HEIGHT_BITRATE[-1][0]
+    for height, min_bps in COMPRESS_HEIGHT_BITRATE:
+        if video_bps >= min_bps:
+            cap = height
+            break
+
+    ladder: list[int | None] = []
+    if original_height is None or original_height <= cap:
+        ladder.append(None)
+    for height in (720, 480, 360):
+        if height <= cap and (original_height is None or height < original_height):
+            ladder.append(height)
+    return ladder or [None]
+
+
+class CompressTimeout(RuntimeError):
+    pass
+
+
+def _run_ffmpeg_with_progress(
+    command: list[str],
+    *,
+    duration: int,
+    deadline: float,
+    progress: ProgressFn | None = None,
+) -> tuple[int, str]:
+    """Run ffmpeg, report percent done, and kill it if it runs past the deadline."""
+    with tempfile.TemporaryFile("w+", encoding="utf-8", errors="replace") as error_log:
+        process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=error_log,
+            text=True,
+        )
+        timed_out = False
+        try:
+            for line in process.stdout or []:
+                if progress and line.startswith("out_time_us="):
+                    value = line.split("=", 1)[1].strip()
+                    if value.isdigit():
+                        done = int(value) / 1_000_000 / max(duration, 1)
+                        progress(min(max(done, 0.0), 1.0) * 100)
+                if time.monotonic() > deadline:
+                    timed_out = True
+                    break
+        finally:
+            if timed_out:
+                process.kill()
+            returncode = process.wait()
+
+        error_log.seek(0)
+        output = error_log.read()[-1000:]
+
+    if timed_out:
+        raise CompressTimeout(output)
+    return returncode, output
+
+
 def compress_video_for_telegram(
     file_path: Path,
     *,
     max_bytes: int = TELEGRAM_MAX_UPLOAD_BYTES,
+    timeout_seconds: int = COMPRESS_TIMEOUT_SECONDS,
     log: LogFn = _noop_log,
+    progress: ProgressFn | None = None,
 ) -> Path:
     """Re-encode to fit Telegram's upload limit, keeping the original aspect ratio."""
     ffmpeg_path = get_ffmpeg_path()
@@ -597,23 +667,24 @@ def compress_video_for_telegram(
 
     metadata = probe_video_metadata(file_path)
     duration = max(metadata.duration or 1, 1)
-    original_height = metadata.height
     target_bytes = min(max_bytes, COMPRESS_TARGET_BYTES)
     audio_bps = 96_000
     video_bps = max(int(target_bytes * 8 * 0.90 / duration) - audio_bps, 120_000)
 
-    heights: list[int | None] = [None]
-    for height in (720, 480, 360):
-        if original_height and original_height > height:
-            heights.append(height)
-
     temp_path = file_path.with_name(file_path.stem + ".tg.mp4")
+    deadline = time.monotonic() + timeout_seconds
     last_error = "неизвестная ошибка"
 
-    for height in heights:
+    for height in compress_height_ladder(metadata.height, video_bps):
         command = [
             ffmpeg_path,
             "-y",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-progress",
+            "pipe:1",
             "-threads",
             "1",
             "-i",
@@ -626,6 +697,10 @@ def compress_video_for_telegram(
             "libx264",
             "-preset",
             "veryfast",
+            # A short lookahead keeps x264 well under the service memory limit;
+            # going over it makes the cgroup throttle the encode to a crawl.
+            "-x264-params",
+            "rc-lookahead=20:sync-lookahead=0",
             "-b:v",
             str(video_bps),
             "-maxrate",
@@ -650,14 +725,24 @@ def compress_video_for_telegram(
             log("Сжимаю, сохраняя исходное разрешение...")
 
         command.append(str(temp_path))
-        result = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        if result.returncode:
-            last_error = (result.stdout or "")[-1000:]
+        try:
+            returncode, output = _run_ffmpeg_with_progress(
+                command,
+                duration=duration,
+                deadline=deadline,
+                progress=progress,
+            )
+        except CompressTimeout:
+            if temp_path.exists():
+                temp_path.unlink()
+            minutes = timeout_seconds // 60
+            raise RuntimeError(
+                f"Сжатие не уложилось в {minutes} мин — ролик слишком тяжёлый "
+                "для этого сервера. Скачай его в меньшем качестве."
+            ) from None
+
+        if returncode:
+            last_error = output.strip() or f"код {returncode}"
             log(f"ffmpeg не смог сжать: {last_error}")
             if temp_path.exists():
                 temp_path.unlink()
@@ -670,6 +755,7 @@ def compress_video_for_telegram(
             temp_path.replace(file_path)
             return file_path
 
+        last_error = f"после сжатия всё ещё {format_mb(size)}"
         video_bps = max(int(video_bps * 0.75), 80_000)
 
     if temp_path.exists():

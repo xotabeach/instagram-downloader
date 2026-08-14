@@ -29,6 +29,7 @@ from telegram.ext import (
 
 from instagram_core import (
     TELEGRAM_MAX_UPLOAD_BYTES,
+    YOUTUBE_QUALITY_HEIGHTS,
     compress_video_for_telegram,
     download_instagram_media,
     extract_media_url,
@@ -41,7 +42,8 @@ from instagram_core import (
 )
 
 MAX_UPLOAD_BYTES = TELEGRAM_MAX_UPLOAD_BYTES
-JOB_TTL_SECONDS = 15 * 60
+JOB_TTL_SECONDS = 30 * 60
+PROGRESS_INTERVAL_SECONDS = 10
 AUTH_STORE_PATH = Path(__file__).with_name("authorized_users.json")
 JOKES_PATH = Path(__file__).with_name("category_b_jokes.json")
 
@@ -95,6 +97,8 @@ class PendingJob:
     oversized: list[Path] = field(default_factory=list)
     sent_video: bool = False
     partial: bool = False
+    height: int | None = None
+    busy: bool = False
 
 
 def load_authorized_user_ids() -> set[int]:
@@ -276,16 +280,17 @@ def cleanup_workdir(path: Path | None) -> None:
 
 
 def purge_expired_jobs() -> None:
+    # A job being compressed keeps its workdir: ffmpeg still reads from it.
     now = time.monotonic()
     for job_id, job in list(_pending_jobs.items()):
-        if now - job.created > JOB_TTL_SECONDS:
+        if not job.busy and now - job.created > JOB_TTL_SECONDS:
             cleanup_workdir(job.workdir)
             _pending_jobs.pop(job_id, None)
 
 
 def cancel_user_jobs(user_id: int) -> None:
     for job_id, job in list(_pending_jobs.items()):
-        if job.user_id == user_id:
+        if job.user_id == user_id and not job.busy:
             cleanup_workdir(job.workdir)
             _pending_jobs.pop(job_id, None)
 
@@ -300,23 +305,66 @@ def quality_keyboard(job_id: str, qualities: list[int]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def compress_keyboard(job_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
+def compress_keyboard(job_id: str, lower_qualities: list[int]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("Сжать до 50 MB", callback_data=f"c:{job_id}")]]
+    if lower_qualities:
+        rows.append(
             [
-                InlineKeyboardButton("Сжать до 50 MB", callback_data=f"c:{job_id}"),
-                InlineKeyboardButton("Отмена", callback_data=f"x:{job_id}"),
+                InlineKeyboardButton(f"Скачать {height}p", callback_data=f"q:{job_id}:{height}")
+                for height in lower_qualities
             ]
-        ]
+        )
+    rows.append([InlineKeyboardButton("Отмена", callback_data=f"x:{job_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def lower_qualities_for(job: "PendingJob") -> list[int]:
+    """Re-downloading YouTube in a smaller size beats re-encoding on this server."""
+    if not is_youtube_url(job.url):
+        return []
+    ceiling = job.height or max(YOUTUBE_QUALITY_HEIGHTS)
+    return [height for height in YOUTUBE_QUALITY_HEIGHTS if height < ceiling][:2]
+
+
+async def offer_compress(status, job_id: str, job: "PendingJob") -> None:
+    file_path = job.oversized[0]
+    hint = (
+        "Сжатие займёт несколько минут."
+        if not lower_qualities_for(job)
+        else "Сжатие займёт несколько минут — перекачать в меньшем качестве быстрее."
     )
-
-
-async def offer_compress(status, job_id: str, file_path: Path) -> None:
     await status.edit_text(
         f"Файл слишком большой для Telegram ({format_mb(file_path.stat().st_size)}).\n"
-        "Лимит ~50 MB. Можно немного сжать — пропорции сохранятся.",
-        reply_markup=compress_keyboard(job_id),
+        f"Лимит ~50 MB. {hint}",
+        reply_markup=compress_keyboard(job_id, lower_qualities_for(job)),
     )
+
+
+async def compress_with_progress(status, source: Path) -> Path:
+    """Compress in a worker thread while the status message shows live percent."""
+    state = {"percent": 0.0}
+    task = asyncio.create_task(
+        asyncio.to_thread(
+            compress_video_for_telegram,
+            source,
+            progress=lambda percent: state.update(percent=percent),
+        )
+    )
+
+    shown = -1
+    while not task.done():
+        done, _ = await asyncio.wait({task}, timeout=PROGRESS_INTERVAL_SECONDS)
+        if done:
+            break
+        percent = int(state["percent"])
+        if percent != shown:
+            shown = percent
+            try:
+                await status.edit_text(f"Сжимаю до ~50 MB... {percent}%")
+            except TelegramError:
+                pass
+
+    return await task
 
 
 async def finish_delivery(reply_target, status, sent_video: bool, partial: bool, workdir: Path | None) -> None:
@@ -340,6 +388,7 @@ async def deliver_or_offer(
     files: list[Path],
     partial: bool,
     sent_video: bool = False,
+    max_height: int | None = None,
 ) -> None:
     oversized: list[Path] = []
     for file_path in files:
@@ -355,7 +404,7 @@ async def deliver_or_offer(
 
     if oversized:
         job_id = secrets.token_hex(8)
-        _pending_jobs[job_id] = PendingJob(
+        job = PendingJob(
             kind="compress",
             user_id=user_id,
             url=url,
@@ -364,8 +413,10 @@ async def deliver_or_offer(
             oversized=oversized,
             sent_video=sent_video,
             partial=partial,
+            height=max_height,
         )
-        await offer_compress(status, job_id, oversized[0])
+        _pending_jobs[job_id] = job
+        await offer_compress(status, job_id, job)
         return
 
     await finish_delivery(reply_target, status, sent_video, partial, workdir)
@@ -409,6 +460,7 @@ async def run_download(
             workdir=workdir,
             files=result.files,
             partial=result.partial,
+            max_height=max_height,
         )
     except Exception:
         cleanup_workdir(workdir)
@@ -503,11 +555,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await status.edit_text("Отменено.")
         return
 
-    if action == "q" and job.kind == "quality":
+    if action == "q" and job.kind in {"quality", "compress"}:
         if len(parts) < 3 or not parts[2].isdigit():
             await status.edit_text("Неизвестное качество.")
             return
         height = int(parts[2])
+        cleanup_workdir(job.workdir)
         _pending_jobs.pop(job_id, None)
         await status.edit_text(f"Скачиваю {height}p...")
         try:
@@ -530,17 +583,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
         source = job.oversized[0]
         await status.edit_text("Сжимаю до ~50 MB...")
+        job.busy = True
         try:
             if _heavy_lock.locked():
                 await status.edit_text("Подожди, обрабатывается другое видео...")
             async with _heavy_lock:
-                compressed = await asyncio.to_thread(compress_video_for_telegram, source)
+                compressed = await compress_with_progress(status, source)
         except Exception as error:
             await status.edit_text(f"Не удалось сжать: {error}")
             cleanup_workdir(job.workdir)
             _pending_jobs.pop(job_id, None)
             traceback.print_exc()
             return
+        finally:
+            job.busy = False
 
         job.oversized.pop(0)
         try:
@@ -550,7 +606,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await status.reply_text(f"Не отправил {compressed.name}: {send_error}")
 
         if job.oversized:
-            await offer_compress(status, job_id, job.oversized[0])
+            await offer_compress(status, job_id, job)
             return
 
         _pending_jobs.pop(job_id, None)
