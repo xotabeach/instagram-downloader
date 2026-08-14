@@ -37,6 +37,13 @@ YOUTUBE_QUALITY_HEIGHTS = (1080, 720, 480, 360)
 YOUTUBE_MAX_DURATION_SECONDS = 20 * 60
 TELEGRAM_MAX_UPLOAD_BYTES = 49 * 1024 * 1024
 COMPRESS_TARGET_BYTES = 45 * 1024 * 1024
+# android_vr has the full quality ladder but YouTube sometimes 403s its
+# media URLs. web_embedded is more stable; tv is last-resort (often 360p).
+YOUTUBE_PLAYER_CLIENT_ATTEMPTS = (
+    ("android_vr",),
+    ("web_embedded",),
+    ("tv", "tv_embedded"),
+)
 
 LogFn = Callable[[str], None]
 
@@ -229,14 +236,29 @@ def instagram_photo_fallback_mode(
     return None
 
 
-def format_selector_for_height(max_height: int | None) -> str:
+def format_selector_for_height(max_height: int | None, *, prefer_avc: bool = False) -> str:
     if max_height is None:
+        if prefer_avc:
+            return "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bestvideo+bestaudio/best"
         return "bestvideo+bestaudio/best"
+    height = f"height<={max_height}"
+    if prefer_avc:
+        return (
+            f"bv*[{height}][vcodec^=avc1]+ba[acodec^=mp4a]/"
+            f"b[{height}][vcodec^=avc1]/"
+            f"bv*[{height}]+ba/"
+            f"b[{height}]/"
+            "bv*+ba/b"
+        )
     return (
-        f"bv*[height<={max_height}]+ba/"
-        f"b[height<={max_height}]/"
+        f"bv*[{height}]+ba/"
+        f"b[{height}]/"
         "bv*+ba/b"
     )
+
+
+def youtube_extractor_args(clients: tuple[str, ...] | list[str]) -> dict:
+    return {"youtube": {"player_client": list(clients)}}
 
 
 def youtube_qualities_from_formats(formats: list[dict]) -> list[int]:
@@ -266,6 +288,8 @@ def build_ydl_options(
     progress_hook: Callable[[dict], None] | None = None,
     max_height: int | None = None,
     noplaylist: bool = False,
+    prefer_avc: bool = False,
+    extractor_args: dict | None = None,
 ) -> dict:
     ffmpeg_path = get_ffmpeg_path()
 
@@ -273,7 +297,7 @@ def build_ydl_options(
         "outtmpl": str(output_path / "%(upload_date|unknown)s_%(id)s_%(title).80s.%(ext)s"),
         # Prefer the best source streams. ffmpeg only remuxes them into MP4;
         # it must not rescale or re-encode the video unless the user asked.
-        "format": format_selector_for_height(max_height),
+        "format": format_selector_for_height(max_height, prefer_avc=prefer_avc),
         "merge_output_format": "mp4",
         "noplaylist": noplaylist,
         "ignoreerrors": True,
@@ -293,6 +317,9 @@ def build_ydl_options(
 
     if ffmpeg_path:
         options["ffmpeg_location"] = ffmpeg_path
+
+    if extractor_args:
+        options["extractor_args"] = extractor_args
 
     if cookies_file:
         options["cookiefile"] = str(cookies_file)
@@ -498,50 +525,63 @@ class YoutubeInfo:
 
 
 def inspect_youtube_video(url: str, log: LogFn = _noop_log) -> YoutubeInfo:
-    options = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "extract_flat": False,
-        "logger": ListLogger(log),
-    }
     ffmpeg_path = get_ffmpeg_path()
-    if ffmpeg_path:
-        options["ffmpeg_location"] = ffmpeg_path
+    last_error = None
 
-    try:
-        with YoutubeDL(options) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except DownloadError as error:
-        return YoutubeInfo(error=str(error))
-    except Exception as error:
-        return YoutubeInfo(error=str(error))
+    for clients in YOUTUBE_PLAYER_CLIENT_ATTEMPTS:
+        options = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "noplaylist": True,
+            "extract_flat": False,
+            "logger": ListLogger(log),
+            "extractor_args": youtube_extractor_args(clients),
+        }
+        if ffmpeg_path:
+            options["ffmpeg_location"] = ffmpeg_path
 
-    if not info:
-        return YoutubeInfo(error="Не удалось получить данные YouTube.")
+        try:
+            with YoutubeDL(options) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except DownloadError as error:
+            last_error = str(error)
+            continue
+        except Exception as error:
+            last_error = str(error)
+            continue
 
-    if info.get("_type") == "playlist":
-        entries = [entry for entry in (info.get("entries") or []) if entry]
-        if not entries:
-            return YoutubeInfo(error="Плейлист пуст.")
-        info = entries[0]
+        if not info:
+            last_error = "Не удалось получить данные YouTube."
+            continue
 
-    duration = info.get("duration")
-    duration_seconds = int(duration) if isinstance(duration, (int, float)) else None
-    if duration_seconds and duration_seconds > YOUTUBE_MAX_DURATION_SECONDS:
-        minutes = duration_seconds // 60
-        return YoutubeInfo(
-            title=str(info.get("title") or ""),
-            duration=duration_seconds,
-            error=f"Ролик слишком длинный ({minutes} мин). Максимум 20 минут.",
-        )
+        if info.get("_type") == "playlist":
+            entries = [entry for entry in (info.get("entries") or []) if entry]
+            if not entries:
+                last_error = "Плейлист пуст."
+                continue
+            info = entries[0]
 
-    return YoutubeInfo(
-        title=str(info.get("title") or ""),
-        duration=duration_seconds,
-        qualities=youtube_qualities_from_formats(info.get("formats") or []),
-    )
+        duration = info.get("duration")
+        duration_seconds = int(duration) if isinstance(duration, (int, float)) else None
+        if duration_seconds and duration_seconds > YOUTUBE_MAX_DURATION_SECONDS:
+            minutes = duration_seconds // 60
+            return YoutubeInfo(
+                title=str(info.get("title") or ""),
+                duration=duration_seconds,
+                error=f"Ролик слишком длинный ({minutes} мин). Максимум 20 минут.",
+            )
+
+        qualities = youtube_qualities_from_formats(info.get("formats") or [])
+        if qualities:
+            return YoutubeInfo(
+                title=str(info.get("title") or ""),
+                duration=duration_seconds,
+                qualities=qualities,
+            )
+        last_error = "YouTube не отдал список качеств."
+
+    return YoutubeInfo(error=last_error or "Не удалось получить данные YouTube.")
 
 
 def compress_video_for_telegram(
@@ -668,6 +708,14 @@ def format_download_error(error_text: str) -> list[str]:
                 "3. Убедись, что пост открывается в браузере под этим аккаунтом.",
             ]
         )
+    elif "HTTP Error 403" in error_text or "unable to download video data" in error_text:
+        tips.extend(
+            [
+                "1. YouTube часто отвечает 403 на один из клиентов плеера.",
+                "2. Бот сам перебирает android_vr → web_embedded → tv.",
+                "3. Если все три не сработали — подожди и попробуй снова, IP мог временно ограничиться.",
+            ]
+        )
     else:
         tips.extend(
             [
@@ -713,19 +761,33 @@ def download_instagram_media(
     existing_media_files = get_media_files(output_path)
 
     try:
-        options = build_ydl_options(
-            output_path,
-            cookies_browser=effective_cookies_browser,
-            cookies_file=effective_cookies_file,
-            log=emit,
-            max_height=max_height,
-            noplaylist=is_youtube_url(url),
-        )
+        youtube = is_youtube_url(url)
+        client_attempts = YOUTUBE_PLAYER_CLIENT_ATTEMPTS if youtube else (None,)
+        result_code = 1
+        files_after_ydl: list[Path] = []
 
-        with YoutubeDL(options) as ydl:
-            result_code = ydl.download([url])
-
-        files_after_ydl = sorted(get_media_files(output_path) - existing_media_files)
+        for index, clients in enumerate(client_attempts):
+            if youtube and clients:
+                emit(f"YouTube-клиент: {', '.join(clients)}")
+            options = build_ydl_options(
+                output_path,
+                cookies_browser=effective_cookies_browser,
+                cookies_file=effective_cookies_file,
+                log=emit,
+                max_height=max_height,
+                noplaylist=youtube,
+                prefer_avc=youtube,
+                extractor_args=youtube_extractor_args(clients) if clients else None,
+            )
+            with YoutubeDL(options) as ydl:
+                result_code = ydl.download([url])
+            files_after_ydl = sorted(get_media_files(output_path) - existing_media_files)
+            if files_after_ydl or not youtube:
+                break
+            if index + 1 < len(client_attempts):
+                emit("YouTube отклонил поток (часто 403). Пробую другой клиент...")
+                for leftover in get_media_files(output_path) - existing_media_files:
+                    leftover.unlink(missing_ok=True)
 
         if is_instagram_url(url):
             photo_mode = instagram_photo_fallback_mode(result_code, files_after_ydl)

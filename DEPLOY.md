@@ -20,6 +20,7 @@
 - одновременно один download/compress
 - сжатие до 50 MB — только по кнопке, FFmpeg `veryfast` и 1 поток
 - systemd: MemoryHigh 160 MB, MemoryMax 220 MB, 1 CPU
+- при 403 YouTube перебирает клиенты плеера `android_vr` → `web_embedded` → `tv`
 
 ---
 
