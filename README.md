@@ -38,6 +38,16 @@ python3 -m pip install -U -r requirements.txt
 
 Нужен Python 3.10+ (в проекте удобно запускать через системный `python3`).
 
+Для **YouTube** дополнительно нужен JS-рантайм — `yt-dlp` решает им challenge-скрипты
+YouTube, иначе будет `HTTP Error 403: Forbidden`:
+
+```bash
+brew install deno
+```
+
+Сами скрипты решателя ставятся вместе с `yt-dlp[default]` из `requirements.txt`.
+Instagram и TikTok работают и без deno.
+
 ### 2. GUI
 
 Двойной клик по `Instagram Downloader.command`  

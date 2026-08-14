@@ -10,6 +10,7 @@
 | Python | 3.12 через `uv` (venv в `.venv`) |
 | Конфиг | `instagram_telegram_bot.env` (на сервере, в git не коммитить) |
 | Cookies | `instagram_cookies.txt` (на сервере, в git не коммитить) |
+| JS-рантайм для YouTube | `deno` в `/usr/local/bin` |
 
 На сервере мало RAM (~480 MB) и там же Docker CrimeaTrip — не гоняй пачку тяжёлых видео подряд.
 
@@ -145,6 +146,43 @@ rsync -avz \
 
 Для бота задан лимит памяти и CPU через systemd override. Это не останавливает
 Docker-контейнеры и не перезапускает Docker Compose.
+
+---
+
+## JS-рантайм для YouTube (deno)
+
+Свежий `yt-dlp` решает JS-челленджи YouTube через внешний рантайм. Без него
+скачивание падает с `HTTP Error 403: Forbidden`, а в логе видно
+`No supported JavaScript runtime could be found`.
+
+Нужны две вещи:
+
+1. `deno` в `PATH` (ставим в `/usr/local/bin`)
+2. пакет EJS-скриптов — он приходит из `yt-dlp[default]` в `requirements.txt`
+
+Установка/обновление deno на сервере:
+
+```bash
+ssh crimeatrip-test 'bash -s' <<'REMOTE'
+set -e
+cd /tmp
+curl -fsSL -o deno.zip https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip
+unzip -oq deno.zip -d /usr/local/bin
+chmod 755 /usr/local/bin/deno
+rm -f deno.zip
+install -d -m 755 /var/cache/deno
+deno --version
+REMOTE
+```
+
+Кэш deno задан в systemd override: `Environment=DENO_DIR=/var/cache/deno`.
+
+Проверка, что yt-dlp видит рантайм:
+
+```bash
+ssh crimeatrip-test 'cd /opt/instagram-downloader && .venv/bin/python -m yt_dlp -v --simulate "https://youtu.be/UQ9KKH9YdJ8" 2>&1 | grep -i "JS runtimes"'
+# ожидаем: [debug] JS runtimes: deno-2.9.5
+```
 
 ---
 
