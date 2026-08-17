@@ -336,10 +336,11 @@ def build_ydl_options(
     if extractor_args:
         options["extractor_args"] = extractor_args
 
-    if cookies_file:
-        options["cookiefile"] = str(cookies_file)
-    elif cookies_browser and cookies_browser != "Без cookies":
-        options["cookiesfrombrowser"] = (cookies_browser,)
+    apply_cookie_options(
+        options,
+        cookies_browser=cookies_browser,
+        cookies_file=cookies_file,
+    )
 
     return options
 
@@ -546,9 +547,56 @@ class YoutubeInfo:
     error: str | None = None
 
 
-def inspect_youtube_video(url: str, log: LogFn = _noop_log) -> YoutubeInfo:
+def apply_cookie_options(
+    options: dict,
+    *,
+    cookies_browser: str | None = None,
+    cookies_file: str | Path | None = None,
+) -> None:
+    if cookies_file:
+        options["cookiefile"] = str(cookies_file)
+    elif cookies_browser and cookies_browser != "Без cookies":
+        options["cookiesfrombrowser"] = (cookies_browser,)
+
+
+def format_age_gate_error(has_cookies: bool) -> str:
+    if has_cookies:
+        return (
+            "YouTube просит подтвердить возраст, и даже с cookies не пускает.\n"
+            "Проверь, что youtube_cookies.txt свежий и аккаунт открывает это видео в браузере."
+        )
+    return (
+        "YouTube просит подтвердить возраст — без cookies такие ролики не отдаёт.\n"
+        "Сделай youtube_cookies.txt:\n"
+        "1) В Chrome зайди на youtube.com под аккаунтом 18+\n"
+        "2) Расширение «Get cookies.txt LOCALLY» → Export для youtube.com\n"
+        "3) Положи как youtube_cookies.txt рядом с ботом\n"
+        "4) В .env укажи YOUTUBE_COOKIES_FILE=.../youtube_cookies.txt и перезапусти бота"
+    )
+
+
+def is_youtube_age_gate_error(text: str) -> bool:
+    lowered = text.lower()
+    return (
+        "sign in to confirm your age" in lowered
+        or "confirm your age" in lowered
+        or "age-restricted" in lowered
+        or "may be inappropriate" in lowered
+    )
+
+
+def inspect_youtube_video(
+    url: str,
+    *,
+    cookies_browser: str | None = None,
+    cookies_file: str | Path | None = None,
+    log: LogFn = _noop_log,
+) -> YoutubeInfo:
     ffmpeg_path = get_ffmpeg_path()
     last_error = None
+    has_cookies = bool(cookies_file) or bool(
+        cookies_browser and cookies_browser != "Без cookies"
+    )
 
     for clients in YOUTUBE_PLAYER_CLIENT_ATTEMPTS:
         options = {
@@ -562,12 +610,19 @@ def inspect_youtube_video(url: str, log: LogFn = _noop_log) -> YoutubeInfo:
         }
         if ffmpeg_path:
             options["ffmpeg_location"] = ffmpeg_path
+        apply_cookie_options(
+            options,
+            cookies_browser=cookies_browser,
+            cookies_file=cookies_file,
+        )
 
         try:
             with YoutubeDL(options) as ydl:
                 info = ydl.extract_info(url, download=False)
         except DownloadError as error:
             last_error = str(error)
+            if is_youtube_age_gate_error(last_error):
+                return YoutubeInfo(error=format_age_gate_error(has_cookies))
             continue
         except Exception as error:
             last_error = str(error)
@@ -603,6 +658,8 @@ def inspect_youtube_video(url: str, log: LogFn = _noop_log) -> YoutubeInfo:
             )
         last_error = "YouTube не отдал список качеств."
 
+    if last_error and is_youtube_age_gate_error(last_error):
+        return YoutubeInfo(error=format_age_gate_error(has_cookies))
     return YoutubeInfo(error=last_error or "Не удалось получить данные YouTube.")
 
 
@@ -847,6 +904,14 @@ def format_download_error(error_text: str) -> list[str]:
                 "3. Убедись, что пост открывается в браузере под этим аккаунтом.",
             ]
         )
+    elif is_youtube_age_gate_error(error_text):
+        tips.extend(
+            [
+                "1. Ролик с возрастным ограничением — нужен youtube_cookies.txt.",
+                "2. Экспортируй cookies с youtube.com (аккаунт 18+) и задай YOUTUBE_COOKIES_FILE.",
+                "3. Подробности: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies",
+            ]
+        )
     elif "HTTP Error 403" in error_text or "unable to download video data" in error_text:
         tips.extend(
             [
@@ -859,8 +924,9 @@ def format_download_error(error_text: str) -> list[str]:
         tips.extend(
             [
                 "1. Проверь ссылку и доступность поста.",
-                "2. Для Instagram обычно нужны cookies.",
-                "3. Для TikTok и YouTube cookies обычно не нужны — проверь, что видео публичное.",
+                "2. Для Instagram обычно нужны cookies (INSTAGRAM_COOKIES_FILE).",
+                "3. Для age-restricted YouTube — YOUTUBE_COOKIES_FILE.",
+                "4. Обычные TikTok/YouTube cookies не требуют.",
             ]
         )
 
@@ -873,6 +939,8 @@ def download_instagram_media(
     *,
     cookies_browser: str | None = None,
     cookies_file: str | Path | None = None,
+    youtube_cookies_browser: str | None = None,
+    youtube_cookies_file: str | Path | None = None,
     log: LogFn | None = None,
     max_height: int | None = None,
 ) -> DownloadResult:
@@ -886,11 +954,17 @@ def download_instagram_media(
     output_path = Path(output_path).expanduser().resolve()
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Instagram cookies are only useful for Instagram; for TikTok they often
-    # just trigger browser/keychain errors and are not needed.
-    use_cookies = is_instagram_url(url)
-    effective_cookies_browser = cookies_browser if use_cookies else None
-    effective_cookies_file = cookies_file if use_cookies else None
+    # Keep cookies scoped to the platform that needs them. Instagram cookies on
+    # TikTok/YouTube are useless and sometimes trigger browser/keychain errors.
+    if is_instagram_url(url):
+        effective_cookies_browser = cookies_browser
+        effective_cookies_file = cookies_file
+    elif is_youtube_url(url):
+        effective_cookies_browser = youtube_cookies_browser
+        effective_cookies_file = youtube_cookies_file
+    else:
+        effective_cookies_browser = None
+        effective_cookies_file = None
 
     emit(f"Ссылка: {url}")
     emit(f"Папка: {output_path}")
@@ -974,6 +1048,7 @@ def download_instagram_media(
             partial = False
 
         if not new_files:
+            joined = "\n".join(messages)
             if is_instagram_url(url) and not effective_cookies_file and (
                 not effective_cookies_browser or effective_cookies_browser == "Без cookies"
             ):
@@ -989,6 +1064,16 @@ def download_instagram_media(
                 emit(
                     "Не удалось скачать даже с cookies. "
                     "Проверь, что пост открывается в браузере под этим аккаунтом и cookies не протухли."
+                )
+            elif youtube and is_youtube_age_gate_error(joined):
+                emit(
+                    format_age_gate_error(
+                        bool(effective_cookies_file)
+                        or bool(
+                            effective_cookies_browser
+                            and effective_cookies_browser != "Без cookies"
+                        )
+                    )
                 )
             return DownloadResult(
                 files=[],
@@ -1007,10 +1092,19 @@ def download_instagram_media(
     except DownloadError as e:
         error_text = str(e)
         emit(f"Ошибка yt-dlp: {error_text}")
+        if is_youtube_url(url) and is_youtube_age_gate_error(error_text):
+            emit(
+                format_age_gate_error(
+                    bool(youtube_cookies_file)
+                    or bool(
+                        youtube_cookies_browser and youtube_cookies_browser != "Без cookies"
+                    )
+                )
+            )
         for tip in format_download_error(error_text):
             emit(tip)
-        return DownloadResult(files=[], messages=messages, error=error_text)
+        return DownloadResult(files=[], messages=messages, error=error_text, partial=False)
 
     except Exception as e:
         emit(f"Неожиданная ошибка: {e}")
-        return DownloadResult(files=[], messages=messages, error=str(e))
+        return DownloadResult(files=[], messages=messages, error=str(e), partial=False)

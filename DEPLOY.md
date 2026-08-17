@@ -9,7 +9,7 @@
 | Systemd unit | `instagram-telegram-bot.service` |
 | Python | 3.12 через `uv` (venv в `.venv`) |
 | Конфиг | `instagram_telegram_bot.env` (на сервере, в git не коммитить) |
-| Cookies | `instagram_cookies.txt` (на сервере, в git не коммитить) |
+| Cookies | `instagram_cookies.txt`, опционально `youtube_cookies.txt` (в git не коммитить) |
 | JS-рантайм для YouTube | `deno` в `/usr/local/bin` |
 
 На сервере мало RAM (~480 MB) и там же Docker CrimeaTrip — не гоняй пачку тяжёлых видео подряд.
@@ -111,6 +111,8 @@ rsync -avz \
   --exclude '__pycache__' \
   --exclude 'instagram_telegram_bot.env' \
   --exclude 'instagram_cookies.txt' \
+  --exclude 'youtube_cookies.txt' \
+  --exclude 'youtube_cookies.txt' \
   --exclude 'authorized_users.json' \
   --exclude '*.mp4' \
   ./ crimeatrip-test:/opt/instagram-downloader/
@@ -128,6 +130,7 @@ ssh crimeatrip-test 'systemctl restart instagram-telegram-bot && systemctl statu
 rsync -avz \
   --exclude '.git' --exclude '.venv' --exclude '__pycache__' \
   --exclude 'instagram_telegram_bot.env' --exclude 'instagram_cookies.txt' \
+  --exclude 'youtube_cookies.txt' \
   --exclude 'authorized_users.json' \
   ./ crimeatrip-test:/opt/instagram-downloader/ \
 && ssh crimeatrip-test 'systemctl restart instagram-telegram-bot'
@@ -153,7 +156,7 @@ rsync -avz \
 - `DEPLOY_SSH_KNOWN_HOSTS`
 
 Деплой сериализован через `concurrency`, поэтому два обновления одновременно не запустятся.
-Файлы `instagram_telegram_bot.env`, `instagram_cookies.txt` и
+Файлы `instagram_telegram_bot.env`, `instagram_cookies.txt`, `youtube_cookies.txt` и
 `authorized_users.json` при обновлении не удаляются и не перезаписываются.
 
 Для бота задан лимит памяти и CPU через systemd override. Это не останавливает
@@ -198,12 +201,17 @@ ssh crimeatrip-test 'cd /opt/instagram-downloader && .venv/bin/python -m yt_dlp 
 
 ---
 
-## Обновить cookies Instagram
+## Обновить cookies Instagram / YouTube
 
 Cookies протухают. Экспортируй свежий `cookies.txt` локально, затем:
 
 ```bash
+# Instagram (фото/карусели)
 scp ./instagram_cookies.txt crimeatrip-test:/opt/instagram-downloader/instagram_cookies.txt
+
+# YouTube (age-restricted ролики)
+scp ./youtube_cookies.txt crimeatrip-test:/opt/instagram-downloader/youtube_cookies.txt
+
 ssh crimeatrip-test 'systemctl restart instagram-telegram-bot'
 ```
 
@@ -211,7 +219,12 @@ ssh crimeatrip-test 'systemctl restart instagram-telegram-bot'
 
 ```env
 INSTAGRAM_COOKIES_FILE=/opt/instagram-downloader/instagram_cookies.txt
+# опционально, только если нужны 18+ ролики:
+YOUTUBE_COOKIES_FILE=/opt/instagram-downloader/youtube_cookies.txt
 ```
+
+YouTube cookies экспортируй именно с `youtube.com` под аккаунтом 18+.
+Подсказки yt-dlp: https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies
 
 ---
 

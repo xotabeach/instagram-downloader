@@ -46,6 +46,7 @@ jobs:
             --exclude '__pycache__' \
             --exclude 'instagram_telegram_bot.env' \
             --exclude 'instagram_cookies.txt' \
+            --exclude 'youtube_cookies.txt' \
             --exclude 'authorized_users.json' \
             --exclude '*.mp4' \
             -e "ssh -i ~/.ssh/deploy_key -p $DEPLOY_PORT" \

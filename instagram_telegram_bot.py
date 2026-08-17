@@ -70,6 +70,8 @@ def load_category_b_jokes() -> list[str]:
 
 COOKIES_BROWSER = os.getenv("INSTAGRAM_COOKIES_FROM_BROWSER", "").strip() or None
 COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "").strip() or None
+YOUTUBE_COOKIES_BROWSER = os.getenv("YOUTUBE_COOKIES_FROM_BROWSER", "").strip() or None
+YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "").strip() or None
 SEND_PREVIEW = env_bool("TELEGRAM_SEND_PREVIEW", True)
 SEND_DOCUMENT = env_bool("TELEGRAM_SEND_DOCUMENT", False)
 AUTH_QUESTION = (
@@ -442,6 +444,8 @@ async def run_download(
                 workdir,
                 cookies_browser=COOKIES_BROWSER,
                 cookies_file=COOKIES_FILE,
+                youtube_cookies_browser=YOUTUBE_COOKIES_BROWSER,
+                youtube_cookies_file=YOUTUBE_COOKIES_FILE,
                 max_height=max_height,
             )
 
@@ -492,7 +496,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if is_youtube_url(url):
         status = await message.reply_text("Смотрю ролик...")
-        info = await asyncio.to_thread(inspect_youtube_video, url)
+        info = await asyncio.to_thread(
+            inspect_youtube_video,
+            url,
+            cookies_browser=YOUTUBE_COOKIES_BROWSER,
+            cookies_file=YOUTUBE_COOKIES_FILE,
+        )
         if info.error:
             await status.edit_text(info.error)
             return
@@ -639,6 +648,18 @@ def main() -> None:
             "(тогда сработают в основном только видео/TikTok)."
         )
 
+    if YOUTUBE_COOKIES_FILE and not Path(YOUTUBE_COOKIES_FILE).expanduser().exists():
+        raise SystemExit(
+            f"Файл YouTube cookies не найден: {YOUTUBE_COOKIES_FILE}\n\n"
+            "Для age-restricted YouTube нужен youtube_cookies.txt:\n"
+            "1) Зайди на youtube.com в Chrome под аккаунтом 18+\n"
+            "2) Расширением «Get cookies.txt LOCALLY» экспортируй cookies\n"
+            f"3) Сохрани файл сюда: {YOUTUBE_COOKIES_FILE}\n"
+            "4) Запусти бота снова\n\n"
+            "Либо убери YOUTUBE_COOKIES_FILE из .env "
+            "(обычные ролики и так скачаются)."
+        )
+
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -646,8 +667,10 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     print("Instagram Telegram bot started.")
-    print(f"Cookies browser: {COOKIES_BROWSER or 'нет'}")
-    print(f"Cookies file: {COOKIES_FILE or 'нет'}")
+    print(f"Instagram cookies browser: {COOKIES_BROWSER or 'нет'}")
+    print(f"Instagram cookies file: {COOKIES_FILE or 'нет'}")
+    print(f"YouTube cookies browser: {YOUTUBE_COOKIES_BROWSER or 'нет'}")
+    print(f"YouTube cookies file: {YOUTUBE_COOKIES_FILE or 'нет'}")
     print(f"Auth question: {AUTH_QUESTION}")
     print(f"Authorized users: {len(AUTHORIZED_USER_IDS)}")
     print(f"Category B jokes: {len(CATEGORY_B_JOKES)}")

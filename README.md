@@ -121,7 +121,8 @@ TELEGRAM_SEND_DOCUMENT=false
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | токен от BotFather |
 | `INSTAGRAM_COOKIES_FROM_BROWSER` | лучше **не использовать** на macOS (Keychain-попапы) |
-| `INSTAGRAM_COOKIES_FILE` | безопасный вариант: путь к `cookies.txt` |
+| `INSTAGRAM_COOKIES_FILE` | безопасный вариант: путь к Instagram `cookies.txt` |
+| `YOUTUBE_COOKIES_FILE` | опционально: cookies с youtube.com для age-restricted роликов |
 | `TELEGRAM_AUTH_QUESTION` | вопрос при первом входе |
 | `TELEGRAM_AUTH_ANSWER` | ответ (регистр и `@` не важны) |
 | `TELEGRAM_SEND_PREVIEW` | слать видео проигрываемым в чате |
@@ -156,7 +157,10 @@ Instagram Telegram Bot.command
 2. Укажи путь в `INSTAGRAM_COOKIES_FILE`
 3. Не включай `INSTAGRAM_COOKIES_FROM_BROWSER`
 
-TikTok и YouTube обычно **cookies не требуют**.
+TikTok cookies не требует. Обычные YouTube-ролики тоже.  
+Но если YouTube отвечает `Sign in to confirm your age` — нужен отдельный
+`youtube_cookies.txt` (экспорт с youtube.com, аккаунт 18+) и
+`YOUTUBE_COOKIES_FILE` в `.env`.
 
 ---
 
