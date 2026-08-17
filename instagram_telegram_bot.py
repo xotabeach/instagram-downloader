@@ -626,6 +626,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 def main() -> None:
+    global YOUTUBE_COOKIES_FILE
+
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         raise SystemExit(
@@ -648,17 +650,15 @@ def main() -> None:
             "(тогда сработают в основном только видео/TikTok)."
         )
 
+    # Only age-restricted videos need this file, so a missing one is a warning:
+    # dying here would take the whole bot down over an optional extra.
     if YOUTUBE_COOKIES_FILE and not Path(YOUTUBE_COOKIES_FILE).expanduser().exists():
-        raise SystemExit(
-            f"Файл YouTube cookies не найден: {YOUTUBE_COOKIES_FILE}\n\n"
-            "Для age-restricted YouTube нужен youtube_cookies.txt:\n"
-            "1) Зайди на youtube.com в Chrome под аккаунтом 18+\n"
-            "2) Расширением «Get cookies.txt LOCALLY» экспортируй cookies\n"
-            f"3) Сохрани файл сюда: {YOUTUBE_COOKIES_FILE}\n"
-            "4) Запусти бота снова\n\n"
-            "Либо убери YOUTUBE_COOKIES_FILE из .env "
-            "(обычные ролики и так скачаются)."
+        print(
+            f"ВНИМАНИЕ: файл YouTube cookies не найден: {YOUTUBE_COOKIES_FILE}\n"
+            "Ролики 18+ скачиваться не будут, остальные — как обычно.\n"
+            "Экспортируй cookies с youtube.com и положи файл по этому пути."
         )
+        YOUTUBE_COOKIES_FILE = None
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
