@@ -15,7 +15,13 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaDocument,
+    InputMediaPhoto,
+    Update,
+)
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -43,6 +49,7 @@ from instagram_core import (
 )
 
 MAX_UPLOAD_BYTES = TELEGRAM_MAX_UPLOAD_BYTES
+MEDIA_GROUP_LIMIT = 10
 JOB_TTL_SECONDS = 30 * 60
 PROGRESS_INTERVAL_SECONDS = 10
 AUTH_STORE_PATH = Path(__file__).with_name("authorized_users.json")
@@ -199,8 +206,8 @@ def welcome_text() -> str:
         "• YouTube — выбор качества (1080p/720p/480p/360p), до 20 минут\n"
         "• видео — в исходном разрешении и соотношении сторон\n"
         "• если файл больше ~50 MB — предложу сжать\n"
-        "• фото — фото\n"
-        "• карусель — каждый элемент отдельно\n"
+        "• фото — одно фото или альбом, если их несколько\n"
+        "• карусель — фото листаются вместе (до 10 в сообщении)\n"
         "После видео — случайный анекдот категории Б."
     )
 
@@ -268,6 +275,33 @@ async def send_media(message, file_path: Path) -> None:
             filename=file_path.name,
             disable_content_type_detection=True,
         )
+
+
+def _chunks(items: list[Path], size: int) -> list[list[Path]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]
+
+
+async def send_photos(message, file_paths: list[Path]) -> None:
+    """Send 2+ photos as swipeable albums of up to 10; a single photo stays a photo."""
+    send_as_document = SEND_DOCUMENT and not SEND_PREVIEW
+    for chunk in _chunks(file_paths, MEDIA_GROUP_LIMIT):
+        if len(chunk) == 1:
+            await send_media(message, chunk[0])
+            continue
+
+        handles = [path.open("rb") for path in chunk]
+        try:
+            if send_as_document:
+                media = [
+                    InputMediaDocument(media=handle, filename=path.name)
+                    for handle, path in zip(handles, chunk)
+                ]
+            else:
+                media = [InputMediaPhoto(media=handle) for handle in handles]
+            await message.reply_media_group(media=media)
+        finally:
+            for handle in handles:
+                handle.close()
 
 
 async def send_random_category_b_joke(message) -> None:
@@ -393,7 +427,26 @@ async def deliver_or_offer(
     max_height: int | None = None,
 ) -> None:
     oversized: list[Path] = []
+    photo_batch: list[Path] = []
+
+    async def flush_photos() -> None:
+        nonlocal photo_batch
+        if not photo_batch:
+            return
+        try:
+            await send_photos(reply_target, photo_batch)
+        except TelegramError as send_error:
+            await reply_target.reply_text(f"Не отправил фото: {send_error}")
+        photo_batch = []
+
     for file_path in files:
+        if is_image(file_path):
+            photo_batch.append(file_path)
+            if len(photo_batch) >= MEDIA_GROUP_LIMIT:
+                await flush_photos()
+            continue
+
+        await flush_photos()
         if is_video(file_path) and file_path.stat().st_size > MAX_UPLOAD_BYTES:
             oversized.append(file_path)
             continue
@@ -403,6 +456,8 @@ async def deliver_or_offer(
                 sent_video = True
         except TelegramError as send_error:
             await reply_target.reply_text(f"Не отправил {file_path.name}: {send_error}")
+
+    await flush_photos()
 
     if oversized:
         job_id = secrets.token_hex(8)
