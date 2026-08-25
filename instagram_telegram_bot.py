@@ -13,6 +13,7 @@ import tempfile
 import time
 import traceback
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 from telegram import (
@@ -43,6 +44,8 @@ from instagram_core import (
     format_mb,
     inspect_youtube_video,
     is_image,
+    is_instagram_url,
+    is_tiktok_url,
     is_video,
     is_youtube_url,
     probe_video_metadata,
@@ -52,7 +55,10 @@ MAX_UPLOAD_BYTES = TELEGRAM_MAX_UPLOAD_BYTES
 MEDIA_GROUP_LIMIT = 10
 JOB_TTL_SECONDS = 30 * 60
 PROGRESS_INTERVAL_SECONDS = 10
+ACTIVE_DAYS = (7, 30)
+PLATFORMS = ("instagram", "tiktok", "youtube")
 AUTH_STORE_PATH = Path(__file__).with_name("authorized_users.json")
+STATS_STORE_PATH = Path(__file__).with_name("bot_stats.json")
 JOKES_PATH = Path(__file__).with_name("category_b_jokes.json")
 
 
@@ -61,6 +67,18 @@ def env_bool(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int_set(name: str) -> set[int]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return set()
+    result: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            result.add(int(part))
+    return result
 
 
 def load_category_b_jokes() -> list[str]:
@@ -89,6 +107,7 @@ AUTH_ANSWER = (
     os.getenv("TELEGRAM_AUTH_ANSWER", "").strip().lower().lstrip("@")
     or "xotabeach"
 )
+ADMIN_USER_IDS = env_int_set("TELEGRAM_ADMIN_USER_IDS")
 CATEGORY_B_JOKES = load_category_b_jokes()
 
 # Users who already saw the question and are waiting for the answer (in-memory).
@@ -133,6 +152,204 @@ def save_authorized_user_ids(user_ids: set[int]) -> None:
 AUTHORIZED_USER_IDS = load_authorized_user_ids()
 
 
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def platform_for_url(url: str) -> str:
+    if is_instagram_url(url):
+        return "instagram"
+    if is_tiktok_url(url):
+        return "tiktok"
+    if is_youtube_url(url):
+        return "youtube"
+    return "other"
+
+
+def empty_platform_stats() -> dict[str, int]:
+    return {"ok": 0, "fail": 0, "videos": 0, "photos": 0}
+
+
+def load_stats() -> dict:
+    if not STATS_STORE_PATH.exists():
+        return {"users": {}}
+    try:
+        data = json.loads(STATS_STORE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"users": {}}
+    if not isinstance(data, dict):
+        return {"users": {}}
+    users = data.get("users")
+    if not isinstance(users, dict):
+        data["users"] = {}
+    return data
+
+
+def save_stats(data: dict) -> None:
+    STATS_STORE_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def ensure_user_stats(data: dict, user_id: int, username: str | None = None) -> dict:
+    users = data.setdefault("users", {})
+    key = str(user_id)
+    entry = users.get(key)
+    if not isinstance(entry, dict):
+        now = utc_now_iso()
+        entry = {
+            "username": username or "",
+            "first_seen": now,
+            "last_active": now,
+            "platforms": {name: empty_platform_stats() for name in PLATFORMS},
+        }
+        users[key] = entry
+    if username:
+        entry["username"] = username
+    platforms = entry.setdefault("platforms", {})
+    for name in PLATFORMS:
+        bucket = platforms.get(name)
+        if not isinstance(bucket, dict):
+            platforms[name] = empty_platform_stats()
+            continue
+        for field_name, default in empty_platform_stats().items():
+            bucket.setdefault(field_name, default)
+    return entry
+
+
+def touch_user_activity(user_id: int, username: str | None = None) -> None:
+    data = load_stats()
+    entry = ensure_user_stats(data, user_id, username)
+    entry["last_active"] = utc_now_iso()
+    save_stats(data)
+
+
+def record_download(
+    user_id: int,
+    url: str,
+    *,
+    success: bool,
+    files: list[Path] | None = None,
+    username: str | None = None,
+) -> None:
+    platform = platform_for_url(url)
+    if platform not in PLATFORMS:
+        return
+
+    data = load_stats()
+    entry = ensure_user_stats(data, user_id, username)
+    entry["last_active"] = utc_now_iso()
+    bucket = entry["platforms"][platform]
+    if success:
+        bucket["ok"] += 1
+        for path in files or []:
+            if is_video(path):
+                bucket["videos"] += 1
+            elif is_image(path):
+                bucket["photos"] += 1
+    else:
+        bucket["fail"] += 1
+    save_stats(data)
+
+
+def parse_iso(value: str | None) -> datetime | None:
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def format_user_label(user_id: str, entry: dict) -> str:
+    username = (entry.get("username") or "").strip().lstrip("@")
+    if username:
+        return f"@{username}"
+    return f"id:{user_id}"
+
+
+def format_stats_report() -> str:
+    data = load_stats()
+    users = data.get("users") or {}
+    now = datetime.now(timezone.utc)
+
+    totals = {name: empty_platform_stats() for name in PLATFORMS}
+    active_counts = {days: 0 for days in ACTIVE_DAYS}
+    ranked: list[tuple[int, str, dict]] = []
+
+    for user_id, entry in users.items():
+        if not isinstance(entry, dict):
+            continue
+        platforms = entry.get("platforms") or {}
+        user_total_ok = 0
+        for name in PLATFORMS:
+            bucket = platforms.get(name) or {}
+            for field_name in empty_platform_stats():
+                totals[name][field_name] += int(bucket.get(field_name) or 0)
+            user_total_ok += int(bucket.get("ok") or 0)
+        ranked.append((user_total_ok, user_id, entry))
+
+        last_active = parse_iso(entry.get("last_active"))
+        if last_active is not None:
+            if last_active.tzinfo is None:
+                last_active = last_active.replace(tzinfo=timezone.utc)
+            age_days = (now - last_active).total_seconds() / 86400
+            for days in ACTIVE_DAYS:
+                if age_days <= days:
+                    active_counts[days] += 1
+
+    total_ok = sum(totals[name]["ok"] for name in PLATFORMS)
+    total_fail = sum(totals[name]["fail"] for name in PLATFORMS)
+    total_videos = sum(totals[name]["videos"] for name in PLATFORMS)
+    total_photos = sum(totals[name]["photos"] for name in PLATFORMS)
+
+    lines = [
+        "Статистика бота",
+        "",
+        f"Авторизованных: {len(AUTHORIZED_USER_IDS)}",
+        f"С активностью в статистике: {len(users)}",
+        f"Активных за 7 дней: {active_counts[7]}",
+        f"Активных за 30 дней: {active_counts[30]}",
+        "",
+        f"Скачиваний успешно: {total_ok}",
+        f"Ошибок: {total_fail}",
+        f"Видео: {total_videos} · фото: {total_photos}",
+        "",
+        "По платформам:",
+    ]
+    labels = {"instagram": "Instagram", "tiktok": "TikTok", "youtube": "YouTube"}
+    for name in PLATFORMS:
+        bucket = totals[name]
+        lines.append(
+            f"• {labels[name]}: {bucket['ok']} ок / {bucket['fail']} ошибок "
+            f"({bucket['videos']} видео, {bucket['photos']} фото)"
+        )
+
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    lines.extend(["", "Топ пользователей:"])
+    if not ranked:
+        lines.append("пока пусто — счёт идёт с момента включения статистики")
+    else:
+        for ok_count, user_id, entry in ranked[:15]:
+            platforms = entry.get("platforms") or {}
+            parts = []
+            for name in PLATFORMS:
+                bucket = platforms.get(name) or {}
+                ok = int(bucket.get("ok") or 0)
+                if ok:
+                    short = {"instagram": "IG", "tiktok": "TT", "youtube": "YT"}[name]
+                    parts.append(f"{short}:{ok}")
+            breakdown = ", ".join(parts) if parts else "0"
+            lines.append(f"• {format_user_label(user_id, entry)} — {ok_count} ({breakdown})")
+
+    return "\n".join(lines)
+
+
+def is_admin(user_id: int | None) -> bool:
+    return user_id is not None and user_id in ADMIN_USER_IDS
+
+
 def normalize_answer(text: str) -> str:
     return text.strip().lower().lstrip("@")
 
@@ -141,10 +358,11 @@ def is_authorized(user_id: int | None) -> bool:
     return user_id is not None and user_id in AUTHORIZED_USER_IDS
 
 
-def authorize_user(user_id: int) -> None:
+def authorize_user(user_id: int, username: str | None = None) -> None:
     AUTHORIZED_USER_IDS.add(user_id)
     _pending_auth.discard(user_id)
     save_authorized_user_ids(AUTHORIZED_USER_IDS)
+    touch_user_activity(user_id, username)
 
 
 async def ask_auth_question(message) -> None:
@@ -183,7 +401,7 @@ async def ensure_authorized(update: Update) -> bool:
         return False
 
     if normalize_answer(text) == AUTH_ANSWER:
-        authorize_user(user.id)
+        authorize_user(user.id, user.username)
         await message.reply_text(
             "Ок, доступ открыт.\n"
             "Пришли ссылку на Instagram, TikTok или YouTube."
@@ -217,11 +435,27 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not await ensure_authorized(update):
         return
+    user = update.effective_user
+    if user:
+        touch_user_activity(user.id, user.username)
     await update.message.reply_text(welcome_text())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await start(update, context)
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not await ensure_authorized(update):
+        return
+    if not is_admin(user.id):
+        await message.reply_text("Команда только для админа.")
+        return
+    await message.reply_text(format_stats_report())
 
 
 async def send_media(message, file_path: Path) -> None:
@@ -486,6 +720,7 @@ async def run_download(
     user_id: int,
     url: str,
     max_height: int | None = None,
+    username: str | None = None,
 ) -> None:
     workdir = Path(tempfile.mkdtemp(prefix="ig_tg_"))
     try:
@@ -506,10 +741,18 @@ async def run_download(
 
         if not result.files:
             details = "\n".join(result.messages[-8:]) if result.messages else (result.error or "unknown")
+            record_download(user_id, url, success=False, username=username)
             await status.edit_text(f"Не удалось скачать.\n\n{details}")
             cleanup_workdir(workdir)
             return
 
+        record_download(
+            user_id,
+            url,
+            success=True,
+            files=result.files,
+            username=username,
+        )
         await status.edit_text(f"Скачано файлов: {len(result.files)}. Отправляю...")
         await deliver_or_offer(
             reply_target,
@@ -522,6 +765,7 @@ async def run_download(
             max_height=max_height,
         )
     except Exception:
+        record_download(user_id, url, success=False, username=username)
         cleanup_workdir(workdir)
         raise
 
@@ -558,6 +802,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             cookies_file=YOUTUBE_COOKIES_FILE,
         )
         if info.error:
+            record_download(user.id, url, success=False, username=user.username)
             await status.edit_text(info.error)
             return
         job_id = secrets.token_hex(8)
@@ -579,7 +824,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     status = await message.reply_text("Скачиваю...")
     try:
-        await run_download(message, status, user_id=user.id, url=url)
+        await run_download(
+            message,
+            status,
+            user_id=user.id,
+            url=url,
+            username=user.username,
+        )
     except Exception as error:
         await status.edit_text(f"Ошибка: {error}")
         traceback.print_exc()
@@ -634,6 +885,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 user_id=user.id,
                 url=job.url,
                 max_height=height,
+                username=user.username,
             )
         except Exception as error:
             await status.edit_text(f"Ошибка: {error}")
@@ -718,6 +970,7 @@ def main() -> None:
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
@@ -728,6 +981,7 @@ def main() -> None:
     print(f"YouTube cookies file: {YOUTUBE_COOKIES_FILE or 'нет'}")
     print(f"Auth question: {AUTH_QUESTION}")
     print(f"Authorized users: {len(AUTHORIZED_USER_IDS)}")
+    print(f"Admin users: {len(ADMIN_USER_IDS)}")
     print(f"Category B jokes: {len(CATEGORY_B_JOKES)}")
     print(f"Send preview: {SEND_PREVIEW}, send document: {SEND_DOCUMENT}")
 

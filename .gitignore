@@ -4,6 +4,7 @@ instagram_telegram_bot.env
 *.env
 !*.env.example
 authorized_users.json
+bot_stats.json
 
 # Cookies / credentials
 *cookies*.txt

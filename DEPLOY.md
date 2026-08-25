@@ -114,6 +114,7 @@ rsync -avz \
   --exclude 'youtube_cookies.txt' \
   --exclude 'youtube_cookies.txt' \
   --exclude 'authorized_users.json' \
+  --exclude 'bot_stats.json' \
   --exclude '*.mp4' \
   ./ crimeatrip-test:/opt/instagram-downloader/
 
@@ -132,6 +133,7 @@ rsync -avz \
   --exclude 'instagram_telegram_bot.env' --exclude 'instagram_cookies.txt' \
   --exclude 'youtube_cookies.txt' \
   --exclude 'authorized_users.json' \
+  --exclude 'bot_stats.json' \
   ./ crimeatrip-test:/opt/instagram-downloader/ \
 && ssh crimeatrip-test 'systemctl restart instagram-telegram-bot'
 ```
@@ -156,8 +158,8 @@ rsync -avz \
 - `DEPLOY_SSH_KNOWN_HOSTS`
 
 Деплой сериализован через `concurrency`, поэтому два обновления одновременно не запустятся.
-Файлы `instagram_telegram_bot.env`, `instagram_cookies.txt`, `youtube_cookies.txt` и
-`authorized_users.json` при обновлении не удаляются и не перезаписываются.
+Файлы `instagram_telegram_bot.env`, `instagram_cookies.txt`, `youtube_cookies.txt`,
+`authorized_users.json` и `bot_stats.json` при обновлении не удаляются и не перезаписываются.
 
 Для бота задан лимит памяти и CPU через systemd override. Это не останавливает
 Docker-контейнеры и не перезапускает Docker Compose.
@@ -277,5 +279,6 @@ ssh crimeatrip-test 'systemctl start instagram-telegram-bot'
 - `instagram_telegram_bot.env`
 - `*cookies*.txt`
 - `authorized_users.json`
+- `bot_stats.json`
 
 На сервер они лежат рядом с кодом, но в git их не пушим.

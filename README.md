@@ -76,6 +76,7 @@ cp instagram_telegram_bot.env.example instagram_telegram_bot.env
 TELEGRAM_BOT_TOKEN=123456:ABC
 TELEGRAM_AUTH_QUESTION=Как зовут автора бота?
 TELEGRAM_AUTH_ANSWER=xotabeach
+TELEGRAM_ADMIN_USER_IDS=1042927926
 TELEGRAM_SEND_PREVIEW=true
 TELEGRAM_SEND_DOCUMENT=false
 # Если Instagram требует логин — только файл cookies, без чтения браузера:
@@ -125,10 +126,12 @@ TELEGRAM_SEND_DOCUMENT=false
 | `YOUTUBE_COOKIES_FILE` | опционально: cookies с youtube.com для age-restricted роликов |
 | `TELEGRAM_AUTH_QUESTION` | вопрос при первом входе |
 | `TELEGRAM_AUTH_ANSWER` | ответ (регистр и `@` не важны) |
+| `TELEGRAM_ADMIN_USER_IDS` | id админов через запятую — команда `/stats` |
 | `TELEGRAM_SEND_PREVIEW` | слать видео проигрываемым в чате |
 | `TELEGRAM_SEND_DOCUMENT` | дополнительно слать копию файлом (вторая загрузка) |
 
 Авторизованные пользователи пишутся в локальный `authorized_users.json` (в git не попадает).  
+Статистика скачиваний — в `bot_stats.json` (тоже локально). Смотреть: `/stats` (только админам).  
 Список анекдотов — `category_b_jokes.json`.
 
 ---
