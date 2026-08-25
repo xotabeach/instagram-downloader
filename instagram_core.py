@@ -259,11 +259,12 @@ def format_selector_for_height(
 ) -> str:
     if max_height is None:
         if prefer_progressive:
-            # Instagram DASH "bestvideo" is often VP9 without audio. Telegram's
-            # in-chat player then shows the merged MP4 silent. Combined MP4 is
-            # usually H.264 and already includes the soundtrack.
+            # Instagram DASH "best" is often mute VP9. Progressive slots 2/1/0 are
+            # usually H.264 with audio when cookies include a live sessionid.
+            # Never prefer `best[ext=mp4]` alone: it ranks mute DASH above them.
             return (
-                "best[ext=mp4]/"
+                "2/1/0/"
+                "best[format_note!*=DASH]/"
                 "bv*[vcodec^=avc1]+ba/"
                 "bestvideo+bestaudio/"
                 "best"
@@ -608,7 +609,7 @@ def is_telegram_compatible_video(metadata: VideoMetadata) -> bool:
 
 
 def ensure_telegram_compatible_video(file_path: Path, log: LogFn = _noop_log) -> None:
-    """Keep the picture, make the soundtrack play in Telegram."""
+    """Fix HE-AAC / VP9 for Telegram without burning the VPS on mute files."""
     ffmpeg_path = get_ffmpeg_path()
     if not ffmpeg_path:
         return
@@ -617,8 +618,17 @@ def ensure_telegram_compatible_video(file_path: Path, log: LogFn = _noop_log) ->
     if is_telegram_compatible_video(metadata):
         return
 
+    if not metadata.has_audio:
+        # Full H.264 re-encode cannot invent a soundtrack and used to stall the
+        # bot for minutes on mute Instagram DASH. Skip and keep the download fast.
+        log(
+            f"В {file_path.name} нет аудиодорожки — пропускаю перекодирование. "
+            "Обычно помогает свежий instagram_cookies.txt с sessionid."
+        )
+        return
+
     temp_path = file_path.with_name(file_path.stem + ".tgplay.mp4")
-    if _is_h264(metadata) and metadata.has_audio:
+    if _is_h264(metadata):
         log(f"Перепаковываю звук в AAC LC для Telegram: {file_path.name}")
         command = [
             ffmpeg_path,
@@ -648,6 +658,7 @@ def ensure_telegram_compatible_video(file_path: Path, log: LogFn = _noop_log) ->
             str(temp_path),
         ]
     else:
+        # Short reels only end up here; still keep the preset cheap for the VPS.
         log(f"Перекодирую в H.264/AAC, чтобы в Telegram был звук: {file_path.name}")
         command = [
             ffmpeg_path,
@@ -663,13 +674,13 @@ def ensure_telegram_compatible_video(file_path: Path, log: LogFn = _noop_log) ->
             "-map",
             "0:v:0",
             "-map",
-            "0:a?",
+            "0:a:0",
             "-c:v",
             "libx264",
             "-preset",
-            "superfast",
+            "ultrafast",
             "-crf",
-            "20",
+            "23",
             "-pix_fmt",
             "yuv420p",
             "-c:a",
@@ -696,6 +707,24 @@ def ensure_telegram_compatible_video(file_path: Path, log: LogFn = _noop_log) ->
 
     temp_path.replace(file_path)
     log(f"Файл готов для Telegram: {file_path.name}")
+
+
+def cookies_file_has_sessionid(cookies_file: str | Path | None) -> bool:
+    if not cookies_file:
+        return False
+    path = Path(cookies_file).expanduser()
+    if not path.exists():
+        return False
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 6 and parts[5] == "sessionid" and parts[-1].strip():
+                return True
+    except OSError:
+        return False
+    return False
 
 
 @dataclass
@@ -1115,9 +1144,15 @@ def download_instagram_media(
 
     # Keep cookies scoped to the platform that needs them. Instagram cookies on
     # TikTok/YouTube are useless and sometimes trigger browser/keychain errors.
+    cookie_scratch: Path | None = None
     if is_instagram_url(url):
         effective_cookies_browser = cookies_browser
         effective_cookies_file = cookies_file
+        if effective_cookies_file and not cookies_file_has_sessionid(effective_cookies_file):
+            emit(
+                "ВНИМАНИЕ: в Instagram cookies нет sessionid — "
+                "часто приходит видео без звука. Обнови cookies.txt из браузера."
+            )
     elif is_youtube_url(url):
         effective_cookies_browser = youtube_cookies_browser
         effective_cookies_file = youtube_cookies_file
@@ -1125,10 +1160,20 @@ def download_instagram_media(
         effective_cookies_browser = None
         effective_cookies_file = None
 
+    # yt-dlp rewrites cookiefile in place; if the session dies it can strip
+    # sessionid from our persistent file. Feed it a throwaway copy instead.
+    if effective_cookies_file:
+        source = Path(effective_cookies_file).expanduser()
+        if source.exists():
+            scratch = Path(tempfile.mkstemp(prefix="cookies_", suffix=".txt")[1])
+            scratch.write_bytes(source.read_bytes())
+            cookie_scratch = scratch
+            effective_cookies_file = scratch
+
     emit(f"Ссылка: {url}")
     emit(f"Папка: {output_path}")
     emit(f"Cookies browser: {effective_cookies_browser or 'нет'}")
-    emit(f"Cookies file: {effective_cookies_file or 'нет'}")
+    emit(f"Cookies file: {cookies_file or youtube_cookies_file or 'нет'}")
 
     existing_media_files = get_media_files(output_path)
 
@@ -1212,8 +1257,8 @@ def download_instagram_media(
 
         if not new_files:
             joined = "\n".join(messages)
-            if is_instagram_url(url) and not effective_cookies_file and (
-                not effective_cookies_browser or effective_cookies_browser == "Без cookies"
+            if is_instagram_url(url) and not cookies_file and (
+                not cookies_browser or cookies_browser == "Без cookies"
             ):
                 emit(
                     "Это фото или карусель Instagram — без cookies их почти не отдают.\n"
@@ -1271,3 +1316,7 @@ def download_instagram_media(
     except Exception as e:
         emit(f"Неожиданная ошибка: {e}")
         return DownloadResult(files=[], messages=messages, error=str(e), partial=False)
+
+    finally:
+        if cookie_scratch is not None:
+            cookie_scratch.unlink(missing_ok=True)
