@@ -69,18 +69,6 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def env_int_set(name: str) -> set[int]:
-    raw = os.getenv(name, "").strip()
-    if not raw:
-        return set()
-    result: set[int] = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if part.isdigit():
-            result.add(int(part))
-    return result
-
-
 def load_category_b_jokes() -> list[str]:
     if not JOKES_PATH.exists():
         return []
@@ -107,7 +95,6 @@ AUTH_ANSWER = (
     os.getenv("TELEGRAM_AUTH_ANSWER", "").strip().lower().lstrip("@")
     or "xotabeach"
 )
-ADMIN_USER_IDS = env_int_set("TELEGRAM_ADMIN_USER_IDS")
 CATEGORY_B_JOKES = load_category_b_jokes()
 
 # Users who already saw the question and are waiting for the answer (in-memory).
@@ -130,21 +117,33 @@ class PendingJob:
     busy: bool = False
 
 
-def load_authorized_user_ids() -> set[int]:
+def load_authorized_user_ids() -> list[int]:
+    """Preserve file order: the first id is the owner/admin."""
     if not AUTH_STORE_PATH.exists():
-        return set()
+        return []
     try:
         data = json.loads(AUTH_STORE_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return set()
+        return []
     if not isinstance(data, list):
-        return set()
-    return {int(item) for item in data}
+        return []
+    seen: set[int] = set()
+    ordered: list[int] = []
+    for item in data:
+        try:
+            user_id = int(item)
+        except (TypeError, ValueError):
+            continue
+        if user_id in seen:
+            continue
+        seen.add(user_id)
+        ordered.append(user_id)
+    return ordered
 
 
-def save_authorized_user_ids(user_ids: set[int]) -> None:
+def save_authorized_user_ids(user_ids: list[int]) -> None:
     AUTH_STORE_PATH.write_text(
-        json.dumps(sorted(user_ids), ensure_ascii=False, indent=2) + "\n",
+        json.dumps(user_ids, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -347,7 +346,8 @@ def format_stats_report() -> str:
 
 
 def is_admin(user_id: int | None) -> bool:
-    return user_id is not None and user_id in ADMIN_USER_IDS
+    """Only the first authorized user (owner) can see /stats."""
+    return bool(AUTHORIZED_USER_IDS) and user_id == AUTHORIZED_USER_IDS[0]
 
 
 def normalize_answer(text: str) -> str:
@@ -359,7 +359,8 @@ def is_authorized(user_id: int | None) -> bool:
 
 
 def authorize_user(user_id: int, username: str | None = None) -> None:
-    AUTHORIZED_USER_IDS.add(user_id)
+    if user_id not in AUTHORIZED_USER_IDS:
+        AUTHORIZED_USER_IDS.append(user_id)
     _pending_auth.discard(user_id)
     save_authorized_user_ids(AUTHORIZED_USER_IDS)
     touch_user_activity(user_id, username)
@@ -981,7 +982,8 @@ def main() -> None:
     print(f"YouTube cookies file: {YOUTUBE_COOKIES_FILE or 'нет'}")
     print(f"Auth question: {AUTH_QUESTION}")
     print(f"Authorized users: {len(AUTHORIZED_USER_IDS)}")
-    print(f"Admin users: {len(ADMIN_USER_IDS)}")
+    if AUTHORIZED_USER_IDS:
+        print(f"Stats admin (first authorized): {AUTHORIZED_USER_IDS[0]}")
     print(f"Category B jokes: {len(CATEGORY_B_JOKES)}")
     print(f"Send preview: {SEND_PREVIEW}, send document: {SEND_DOCUMENT}")
 
