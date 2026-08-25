@@ -251,8 +251,23 @@ def instagram_photo_fallback_mode(
     return None
 
 
-def format_selector_for_height(max_height: int | None, *, prefer_avc: bool = False) -> str:
+def format_selector_for_height(
+    max_height: int | None,
+    *,
+    prefer_avc: bool = False,
+    prefer_progressive: bool = False,
+) -> str:
     if max_height is None:
+        if prefer_progressive:
+            # Instagram DASH "bestvideo" is often VP9 without audio. Telegram's
+            # in-chat player then shows the merged MP4 silent. Combined MP4 is
+            # usually H.264 and already includes the soundtrack.
+            return (
+                "best[ext=mp4]/"
+                "bv*[vcodec^=avc1]+ba/"
+                "bestvideo+bestaudio/"
+                "best"
+            )
         if prefer_avc:
             return "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bestvideo+bestaudio/best"
         return "bestvideo+bestaudio/best"
@@ -304,6 +319,7 @@ def build_ydl_options(
     max_height: int | None = None,
     noplaylist: bool = False,
     prefer_avc: bool = False,
+    prefer_progressive: bool = False,
     extractor_args: dict | None = None,
 ) -> dict:
     ffmpeg_path = get_ffmpeg_path()
@@ -312,7 +328,11 @@ def build_ydl_options(
         "outtmpl": str(output_path / "%(upload_date|unknown)s_%(id)s_%(title).80s.%(ext)s"),
         # Prefer the best source streams. ffmpeg only remuxes them into MP4;
         # it must not rescale or re-encode the video unless the user asked.
-        "format": format_selector_for_height(max_height, prefer_avc=prefer_avc),
+        "format": format_selector_for_height(
+            max_height,
+            prefer_avc=prefer_avc,
+            prefer_progressive=prefer_progressive,
+        ),
         "merge_output_format": "mp4",
         "noplaylist": noplaylist,
         "ignoreerrors": True,
@@ -479,9 +499,16 @@ class VideoMetadata:
     height: int | None = None
     duration: int | None = None
     fps: float | None = None
+    vcodec: str | None = None
+    acodec: str | None = None
+    audio_profile: str | None = None
+    has_audio: bool = False
 
 
 _VIDEO_STREAM_RE = re.compile(r"Video:.*?,\s(\d{2,5})x(\d{2,5})")
+_VIDEO_CODEC_RE = re.compile(r"Video:\s*([A-Za-z0-9]+)")
+_AUDIO_CODEC_RE = re.compile(r"Audio:\s*([A-Za-z0-9]+)")
+_AUDIO_PROFILE_RE = re.compile(r"Audio:\s*[^(]+\(([^)]+)\)")
 _FPS_RE = re.compile(r",\s(\d+(?:\.\d+)?)\sfps")
 _DISPLAY_ASPECT_RE = re.compile(r"DAR (\d+):(\d+)")
 _DURATION_RE = re.compile(r"Duration: (\d+):(\d{2}):(\d{2}(?:\.\d+)?)")
@@ -502,10 +529,22 @@ def probe_video_metadata(file_path: Path) -> VideoMetadata:
         text=True,
     )
     output = result.stdout
+    vcodec_match = _VIDEO_CODEC_RE.search(output)
+    acodec_match = _AUDIO_CODEC_RE.search(output)
+    profile_match = _AUDIO_PROFILE_RE.search(output)
+    vcodec = vcodec_match.group(1).lower() if vcodec_match else None
+    acodec = acodec_match.group(1).lower() if acodec_match else None
+    audio_profile = profile_match.group(1) if profile_match else None
+    has_audio = acodec is not None
 
     size_match = _VIDEO_STREAM_RE.search(output)
     if not size_match:
-        return VideoMetadata()
+        return VideoMetadata(
+            vcodec=vcodec,
+            acodec=acodec,
+            audio_profile=audio_profile,
+            has_audio=has_audio,
+        )
 
     width = int(size_match.group(1))
     height = int(size_match.group(2))
@@ -536,7 +575,127 @@ def probe_video_metadata(file_path: Path) -> VideoMetadata:
     if fps_match:
         fps = float(fps_match.group(1))
 
-    return VideoMetadata(width=width, height=height, duration=duration, fps=fps)
+    return VideoMetadata(
+        width=width,
+        height=height,
+        duration=duration,
+        fps=fps,
+        vcodec=vcodec,
+        acodec=acodec,
+        audio_profile=audio_profile,
+        has_audio=has_audio,
+    )
+
+
+def _is_h264(metadata: VideoMetadata) -> bool:
+    codec = metadata.vcodec or ""
+    return codec in {"h264", "avc", "avc1"} or codec.startswith("avc")
+
+
+def _is_he_aac(metadata: VideoMetadata) -> bool:
+    profile = (metadata.audio_profile or "").lower()
+    return "he-aac" in profile or "he aac" in profile or "aac_he" in profile
+
+
+def is_telegram_compatible_video(metadata: VideoMetadata) -> bool:
+    """Telegram's in-chat player wants H.264 + AAC LC. VP9/HE-AAC often plays mute."""
+    if not metadata.has_audio or not _is_h264(metadata):
+        return False
+    acodec = metadata.acodec or ""
+    if acodec not in {"aac", "mp4a"}:
+        return False
+    return not _is_he_aac(metadata)
+
+
+def ensure_telegram_compatible_video(file_path: Path, log: LogFn = _noop_log) -> None:
+    """Keep the picture, make the soundtrack play in Telegram."""
+    ffmpeg_path = get_ffmpeg_path()
+    if not ffmpeg_path:
+        return
+
+    metadata = probe_video_metadata(file_path)
+    if is_telegram_compatible_video(metadata):
+        return
+
+    temp_path = file_path.with_name(file_path.stem + ".tgplay.mp4")
+    if _is_h264(metadata) and metadata.has_audio:
+        log(f"Перепаковываю звук в AAC LC для Telegram: {file_path.name}")
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-threads",
+            "1",
+            "-i",
+            str(file_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            str(temp_path),
+        ]
+    else:
+        log(f"Перекодирую в H.264/AAC, чтобы в Telegram был звук: {file_path.name}")
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-threads",
+            "1",
+            "-i",
+            str(file_path),
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "superfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            str(temp_path),
+        ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if result.returncode or not temp_path.exists():
+        log(f"Не удалось починить звук {file_path.name}: {(result.stdout or '')[-400:]}")
+        temp_path.unlink(missing_ok=True)
+        return
+
+    temp_path.replace(file_path)
+    log(f"Файл готов для Telegram: {file_path.name}")
 
 
 @dataclass
@@ -990,6 +1149,7 @@ def download_instagram_media(
                 max_height=max_height,
                 noplaylist=youtube,
                 prefer_avc=youtube,
+                prefer_progressive=is_instagram_url(url),
                 extractor_args=youtube_extractor_args(clients) if clients else None,
             )
             with YoutubeDL(options) as ydl:
@@ -1042,6 +1202,9 @@ def download_instagram_media(
         new_files = filter_video_thumbnails(
             sorted(get_media_files(output_path) - existing_media_files)
         )
+        for file_path in new_files:
+            if is_video(file_path):
+                ensure_telegram_compatible_video(file_path, emit)
         partial = bool(result_code) and bool(new_files)
         # yt-dlp exits non-zero on photo-only posts even when photos downloaded fine.
         if partial and is_instagram_url(url) and new_files and all(is_image(path) for path in new_files):
