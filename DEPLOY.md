@@ -115,6 +115,7 @@ rsync -avz \
   --exclude 'youtube_cookies.txt' \
   --exclude 'authorized_users.json' \
   --exclude 'bot_stats.json' \
+  --exclude 'cookies_state.json' \
   --exclude '*.mp4' \
   ./ crimeatrip-test:/opt/instagram-downloader/
 
@@ -134,6 +135,7 @@ rsync -avz \
   --exclude 'youtube_cookies.txt' \
   --exclude 'authorized_users.json' \
   --exclude 'bot_stats.json' \
+  --exclude 'cookies_state.json' \
   ./ crimeatrip-test:/opt/instagram-downloader/ \
 && ssh crimeatrip-test 'systemctl restart instagram-telegram-bot'
 ```

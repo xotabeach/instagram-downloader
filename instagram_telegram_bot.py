@@ -38,11 +38,14 @@ from instagram_core import (
     TELEGRAM_MAX_UPLOAD_BYTES,
     YOUTUBE_QUALITY_HEIGHTS,
     compress_video_for_telegram,
+    cookies_file_has_sessionid,
+    detect_instagram_auth_failure,
     download_instagram_media,
     estimate_compress_for_file,
     extract_media_url,
     format_mb,
     inspect_youtube_video,
+    is_audio_only,
     is_image,
     is_instagram_url,
     is_tiktok_url,
@@ -59,6 +62,7 @@ ACTIVE_DAYS = (7, 30)
 PLATFORMS = ("instagram", "tiktok", "youtube")
 AUTH_STORE_PATH = Path(__file__).with_name("authorized_users.json")
 STATS_STORE_PATH = Path(__file__).with_name("bot_stats.json")
+COOKIES_STATE_PATH = Path(__file__).with_name("cookies_state.json")
 JOKES_PATH = Path(__file__).with_name("category_b_jokes.json")
 
 
@@ -87,6 +91,8 @@ YOUTUBE_COOKIES_BROWSER = os.getenv("YOUTUBE_COOKIES_FROM_BROWSER", "").strip() 
 YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "").strip() or None
 SEND_PREVIEW = env_bool("TELEGRAM_SEND_PREVIEW", True)
 SEND_DOCUMENT = env_bool("TELEGRAM_SEND_DOCUMENT", False)
+# Telegram compresses reply_photo; documents keep the original pixels and aspect ratio.
+PHOTO_PREVIEW = env_bool("TELEGRAM_PHOTO_PREVIEW", False)
 AUTH_QUESTION = (
     os.getenv("TELEGRAM_AUTH_QUESTION", "").strip()
     or "Как зовут автора бота?"
@@ -350,6 +356,164 @@ def is_admin(user_id: int | None) -> bool:
     return bool(AUTHORIZED_USER_IDS) and user_id == AUTHORIZED_USER_IDS[0]
 
 
+def load_cookies_state() -> dict:
+    if not COOKIES_STATE_PATH.exists():
+        return {}
+    try:
+        data = json.loads(COOKIES_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_cookies_state(data: dict) -> None:
+    COOKIES_STATE_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def cookies_mtime_iso(path: str | Path | None) -> str | None:
+    if not path:
+        return None
+    file_path = Path(path).expanduser()
+    if not file_path.exists():
+        return None
+    return datetime.fromtimestamp(file_path.stat().st_mtime, timezone.utc).replace(
+        microsecond=0
+    ).isoformat()
+
+
+def netscape_cookie_names(text: str, domain_needle: str) -> set[str]:
+    names: set[str] = set()
+    for line in text.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        if domain_needle not in parts[0].lower():
+            continue
+        if parts[5].strip():
+            names.add(parts[5].strip())
+    return names
+
+
+def detect_cookies_platform(text: str) -> str | None:
+    ig = netscape_cookie_names(text, "instagram.com")
+    yt = netscape_cookie_names(text, "youtube.com") | netscape_cookie_names(text, "google.com")
+    if "sessionid" in ig:
+        return "instagram"
+    if yt & {"SID", "HSID", "SSID", "LOGIN_INFO", "__Secure-1PSID", "SAPISID"}:
+        return "youtube"
+    if ig:
+        return "instagram"
+    if yt:
+        return "youtube"
+    return None
+
+
+def validate_cookies_text(text: str, platform: str) -> str | None:
+    """Return error message or None if cookies look usable."""
+    if "\t" not in text and "# Netscape" not in text:
+        return "Это не Netscape cookies.txt (нужен экспорт из «Get cookies.txt LOCALLY»)."
+    if platform == "instagram":
+        names = netscape_cookie_names(text, "instagram.com")
+        if "sessionid" not in names:
+            return "В файле нет sessionid для Instagram."
+        return None
+    if platform == "youtube":
+        names = netscape_cookie_names(text, "youtube.com") | netscape_cookie_names(
+            text, "google.com"
+        )
+        if not (names & {"SID", "HSID", "SSID", "LOGIN_INFO", "__Secure-1PSID", "SAPISID"}):
+            return "В файле нет типичных YouTube/Google login cookies."
+        return None
+    return "Неизвестный тип cookies."
+
+
+def install_cookies_file(target: str | Path, content: bytes) -> Path:
+    path = Path(target).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_bytes(content)
+    tmp.replace(path)
+    state = load_cookies_state()
+    state["last_upload_at"] = utc_now_iso()
+    state["last_alert_at"] = None
+    state["last_alert_reason"] = None
+    state["cookies_mtime"] = cookies_mtime_iso(path)
+    save_cookies_state(state)
+    return path
+
+
+def format_cookies_status() -> str:
+    ig_path = Path(COOKIES_FILE).expanduser() if COOKIES_FILE else None
+    yt_path = Path(YOUTUBE_COOKIES_FILE).expanduser() if YOUTUBE_COOKIES_FILE else None
+    state = load_cookies_state()
+    lines = ["Cookies"]
+    if ig_path:
+        exists = ig_path.exists()
+        has_sid = cookies_file_has_sessionid(ig_path) if exists else False
+        lines.append(
+            f"Instagram: {'есть' if exists else 'нет файла'}"
+            + (f", sessionid={'ок' if has_sid else 'нет'}" if exists else "")
+            + (f", обновлён {cookies_mtime_iso(ig_path)}" if exists else "")
+        )
+    else:
+        lines.append("Instagram: путь не задан в .env")
+    if yt_path:
+        lines.append(
+            f"YouTube: {'есть' if yt_path.exists() else 'нет файла'}"
+            + (f", обновлён {cookies_mtime_iso(yt_path)}" if yt_path.exists() else "")
+        )
+    else:
+        lines.append("YouTube: не задан")
+    if state.get("last_alert_at"):
+        lines.append(
+            f"Последний алерт: {state['last_alert_at']}"
+            + (f" ({state.get('last_alert_reason')})" if state.get("last_alert_reason") else "")
+        )
+    lines.append("")
+    lines.append(
+        "Чтобы обновить — просто пришли сюда файл cookies.txt "
+        "(экспорт «Get cookies.txt LOCALLY»). Бот сам поймёт Instagram или YouTube."
+    )
+    return "\n".join(lines)
+
+
+async def notify_admin_cookies_dead(context_or_bot, reason: str) -> None:
+    if not AUTHORIZED_USER_IDS:
+        return
+    state = load_cookies_state()
+    current_mtime = cookies_mtime_iso(COOKIES_FILE)
+    # Don't spam: one alert until cookies are replaced.
+    if (
+        state.get("last_alert_at")
+        and state.get("cookies_mtime") == current_mtime
+        and state.get("last_alert_reason") == reason
+    ):
+        return
+
+    bot = getattr(context_or_bot, "bot", context_or_bot)
+    text = (
+        "Instagram cookies слетели.\n"
+        f"Причина: {reason}\n\n"
+        "Пришли новый cookies.txt сюда файлом "
+        "(Chrome → «Get cookies.txt LOCALLY» → Export).\n"
+        "Или /cookies чтобы глянуть статус."
+    )
+    try:
+        await bot.send_message(chat_id=AUTHORIZED_USER_IDS[0], text=text)
+    except TelegramError:
+        return
+
+    state["last_alert_at"] = utc_now_iso()
+    state["last_alert_reason"] = reason
+    state["cookies_mtime"] = current_mtime
+    save_cookies_state(state)
+
+
 def normalize_answer(text: str) -> str:
     return text.strip().lower().lstrip("@")
 
@@ -425,9 +589,10 @@ def welcome_text() -> str:
         "• YouTube — выбор качества (1080p/720p/480p/360p), до 20 минут\n"
         "• видео — в исходном разрешении и соотношении сторон\n"
         "• если файл больше ~50 MB — предложу сжать\n"
-        "• фото — одно фото или альбом, если их несколько\n"
+        "• фото — файлом в исходном разрешении (или превью, если включить TELEGRAM_PHOTO_PREVIEW)\n"
         "• карусель — фото листаются вместе (до 10 в сообщении)\n"
-        "После видео — случайный анекдот категории Б."
+        "После видео — случайный анекдот категории Б.\n"
+        "Админ: /stats, /cookies (можно прислать cookies.txt файлом)."
     )
 
 
@@ -457,6 +622,84 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await message.reply_text("Команда только для админа.")
         return
     await message.reply_text(format_stats_report())
+
+
+async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    user = update.effective_user
+    if not message or not user:
+        return
+    if not await ensure_authorized(update):
+        return
+    if not is_admin(user.id):
+        await message.reply_text("Команда только для админа.")
+        return
+    await message.reply_text(format_cookies_status())
+
+
+async def handle_cookies_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    user = update.effective_user
+    if not message or not user or not message.document:
+        return
+    if not await ensure_authorized(update):
+        return
+    if not is_admin(user.id):
+        return
+
+    document = message.document
+    filename = (document.file_name or "").lower()
+    if document.file_size and document.file_size > 512 * 1024:
+        await message.reply_text("Файл слишком большой для cookies.txt.")
+        return
+
+    tg_file = await document.get_file()
+    raw = bytes(await tg_file.download_as_bytearray())
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        await message.reply_text("Не удалось прочитать файл как текст.")
+        return
+
+    platform = detect_cookies_platform(text)
+    if not platform:
+        # Allow explicit filenames as a hint when auto-detect fails.
+        if "youtube" in filename:
+            platform = "youtube"
+        elif "instagram" in filename or "cookies" in filename:
+            platform = "instagram"
+        else:
+            await message.reply_text(
+                "Не похоже на Instagram/YouTube cookies.txt.\n"
+                "Экспортируй через «Get cookies.txt LOCALLY» и пришли ещё раз."
+            )
+            return
+
+    error = validate_cookies_text(text, platform)
+    if error:
+        await message.reply_text(error)
+        return
+
+    if platform == "instagram":
+        if not COOKIES_FILE:
+            await message.reply_text("INSTAGRAM_COOKIES_FILE не задан в .env на сервере.")
+            return
+        path = install_cookies_file(COOKIES_FILE, raw)
+        await message.reply_text(
+            f"Instagram cookies обновлены.\n"
+            f"Файл: {path}\n"
+            f"sessionid: ок\n"
+            "Можно снова кидать ссылки — рестарт бота не нужен."
+        )
+        return
+
+    if not YOUTUBE_COOKIES_FILE:
+        await message.reply_text("YOUTUBE_COOKIES_FILE не задан в .env на сервере.")
+        return
+    path = install_cookies_file(YOUTUBE_COOKIES_FILE, raw)
+    await message.reply_text(
+        f"YouTube cookies обновлены.\nФайл: {path}\nРестарт бота не нужен."
+    )
 
 
 async def send_media(message, file_path: Path) -> None:
@@ -494,7 +737,7 @@ async def send_media(message, file_path: Path) -> None:
 
     if is_image(file_path):
         with file_path.open("rb") as media_file:
-            if SEND_PREVIEW or not SEND_DOCUMENT:
+            if PHOTO_PREVIEW and (SEND_PREVIEW or not SEND_DOCUMENT):
                 await message.reply_photo(photo=media_file)
             else:
                 await message.reply_document(
@@ -502,6 +745,16 @@ async def send_media(message, file_path: Path) -> None:
                     filename=file_path.name,
                     disable_content_type_detection=True,
                 )
+        return
+
+    if is_audio_only(file_path):
+        metadata = await asyncio.to_thread(probe_video_metadata, file_path)
+        with file_path.open("rb") as media_file:
+            await message.reply_audio(
+                audio=media_file,
+                duration=metadata.duration,
+                filename=file_path.name,
+            )
         return
 
     with file_path.open("rb") as media_file:
@@ -518,7 +771,7 @@ def _chunks(items: list[Path], size: int) -> list[list[Path]]:
 
 async def send_photos(message, file_paths: list[Path]) -> None:
     """Send 2+ photos as swipeable albums of up to 10; a single photo stays a photo."""
-    send_as_document = SEND_DOCUMENT and not SEND_PREVIEW
+    send_as_document = not PHOTO_PREVIEW or (SEND_DOCUMENT and not SEND_PREVIEW)
     for chunk in _chunks(file_paths, MEDIA_GROUP_LIMIT):
         if len(chunk) == 1:
             await send_media(message, chunk[0])
@@ -682,6 +935,13 @@ async def deliver_or_offer(
             continue
 
         await flush_photos()
+        if is_audio_only(file_path):
+            try:
+                await send_media(reply_target, file_path)
+            except TelegramError as send_error:
+                await reply_target.reply_text(f"Не отправил аудио: {send_error}")
+            continue
+
         if is_video(file_path) and file_path.stat().st_size > MAX_UPLOAD_BYTES:
             oversized.append(file_path)
             continue
@@ -743,7 +1003,36 @@ async def run_download(
         if not result.files:
             details = "\n".join(result.messages[-8:]) if result.messages else (result.error or "unknown")
             record_download(user_id, url, success=False, username=username)
-            await status.edit_text(f"Не удалось скачать.\n\n{details}")
+
+            auth_error = None
+            if is_instagram_url(url):
+                if result.error and str(result.error).startswith("instagram_auth:"):
+                    auth_error = str(result.error).split(":", 1)[1]
+                else:
+                    auth_error = detect_instagram_auth_failure(result.messages)
+
+            if auth_error:
+                reason = {
+                    "checkpoint_required": "checkpoint / подтверждение входа",
+                    "invalid_session": "сессия недействительна (login redirect)",
+                    "missing_sessionid": "нет sessionid в cookies",
+                }.get(auth_error, auth_error)
+                await notify_admin_cookies_dead(reply_target.get_bot(), reason)
+                if is_admin(user_id):
+                    await status.edit_text(
+                        "Instagram cookies слетели.\n"
+                        f"Причина: {reason}\n\n"
+                        "Пришли новый cookies.txt сюда файлом "
+                        "(Chrome → Get cookies.txt LOCALLY → Export).\n"
+                        "/cookies — статус."
+                    )
+                else:
+                    await status.edit_text(
+                        "Сейчас Instagram не пускает (сессия бота слетела).\n"
+                        "Админ уже уведомлён — попробуй позже."
+                    )
+            else:
+                await status.edit_text(f"Не удалось скачать.\n\n{details}")
             cleanup_workdir(workdir)
             return
 
@@ -972,7 +1261,9 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("cookies", cookies_command))
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_cookies_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     print("Instagram Telegram bot started.")
@@ -985,7 +1276,10 @@ def main() -> None:
     if AUTHORIZED_USER_IDS:
         print(f"Stats admin (first authorized): {AUTHORIZED_USER_IDS[0]}")
     print(f"Category B jokes: {len(CATEGORY_B_JOKES)}")
-    print(f"Send preview: {SEND_PREVIEW}, send document: {SEND_DOCUMENT}")
+    print(
+        f"Send preview: {SEND_PREVIEW}, send document: {SEND_DOCUMENT}, "
+        f"photo preview: {PHOTO_PREVIEW}"
+    )
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

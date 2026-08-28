@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import html
+import json
 import re
 import ssl
 import subprocess
@@ -33,7 +34,13 @@ INSTAGRAM_PAGE_USER_AGENT = "Mozilla/5.0"
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
-MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
+AUDIO_EXTENSIONS = {".m4a", ".mp3", ".aac", ".opus", ".ogg", ".wav"}
+MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
+
+GALLERY_DL_INSTAGRAM_FILTER = (
+    "((extension in ('jpg', 'jpeg', 'png', 'webp', 'heic', 'heif') and not video_url) "
+    "or audio_url)"
+)
 
 YOUTUBE_QUALITY_HEIGHTS = (1080, 720, 480, 360)
 YOUTUBE_MAX_DURATION_SECONDS = 20 * 60
@@ -190,8 +197,33 @@ def is_image(path: Path) -> bool:
     return path.suffix.lower() in IMAGE_EXTENSIONS
 
 
+def is_audio_only(path: Path) -> bool:
+    suffix = path.suffix.lower()
+    if suffix in AUDIO_EXTENSIONS:
+        return True
+    if suffix not in VIDEO_EXTENSIONS:
+        return False
+    metadata = probe_video_metadata(path)
+    return metadata.has_audio and not metadata.vcodec
+
+
 def is_video(path: Path) -> bool:
-    return path.suffix.lower() in VIDEO_EXTENSIONS
+    return path.suffix.lower() in VIDEO_EXTENSIONS and not is_audio_only(path)
+
+
+def sort_files_for_delivery(files: list[Path]) -> list[Path]:
+    """Photos first, then attached music, then videos."""
+
+    def sort_key(path: Path) -> tuple[int, str]:
+        if is_image(path):
+            bucket = 0
+        elif is_audio_only(path):
+            bucket = 1
+        else:
+            bucket = 2
+        return (bucket, path.name)
+
+    return sorted(files, key=sort_key)
 
 
 def filter_video_thumbnails(files: list[Path]) -> list[Path]:
@@ -366,53 +398,164 @@ def build_ydl_options(
     return options
 
 
+def cookie_header_from_file(cookies_file: str | Path | None) -> str | None:
+    if not cookies_file:
+        return None
+    path = Path(cookies_file).expanduser()
+    if not path.exists():
+        return None
+    pairs: list[str] = []
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.split("\t")
+            if len(parts) >= 7 and parts[5] and parts[6]:
+                pairs.append(f"{parts[5]}={parts[6]}")
+    except OSError:
+        return None
+    return "; ".join(pairs) if pairs else None
+
+
+def _instagram_json_unescape(text: str) -> str:
+    return html.unescape(text.replace("\\/", "/").replace("\\u0026", "&"))
+
+
+def instagram_image_url_score(url: str) -> int:
+    """Higher is better. Penalize obvious profile-grid crops and tiny thumbs."""
+    lowered = url.lower()
+    best = 0
+    for match in re.finditer(r"s(\d+)x(\d+)", lowered):
+        best = max(best, int(match.group(1)) * int(match.group(2)))
+    if best:
+        return best
+    if any(token in lowered for token in ("s150x150", "s320x320", "s640x640")):
+        return 640 * 640
+    if "stp=" in lowered:
+        return 720 * 720
+    return 50_000_000
+
+
+def _parse_instagram_candidate_arrays(page_html: str) -> list[list[dict]]:
+    arrays: list[list[dict]] = []
+    marker = '"candidates"'
+    start = 0
+    while True:
+        index = page_html.find(marker, start)
+        if index == -1:
+            break
+        start = index + len(marker)
+        bracket = page_html.find("[", index)
+        if bracket == -1:
+            continue
+        depth = 0
+        for offset, char in enumerate(page_html[bracket:], start=bracket):
+            if char == "[":
+                depth += 1
+            elif char == "]":
+                depth -= 1
+                if depth == 0:
+                    blob = page_html[bracket : offset + 1]
+                    try:
+                        parsed = json.loads(_instagram_json_unescape(blob))
+                    except json.JSONDecodeError:
+                        parsed = None
+                    if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                        if all("url" in item for item in parsed[:3]):
+                            arrays.append(parsed)
+                    break
+    return arrays
+
+
 def find_instagram_photo_urls(page_html: str) -> list[str]:
-    raw_urls = re.findall(
-        r"https://scontent[^\"'<> ]+?\.jpg\?[^\"'<> ]+",
-        page_html,
-    )
+    best_by_path: dict[str, tuple[int, str]] = {}
 
-    photo_urls = []
-    seen_paths = set()
-
-    for raw_url in raw_urls:
-        photo_url = html.unescape(raw_url)
-
+    def consider(raw_url: str) -> None:
+        photo_url = _instagram_json_unescape(raw_url)
         if "cdninstagram.com" not in photo_url:
-            continue
-
+            return
         path_key = urlparse(photo_url).path
-        if path_key in seen_paths:
-            continue
+        score = instagram_image_url_score(photo_url)
+        current = best_by_path.get(path_key)
+        if current is None or score > current[0]:
+            best_by_path[path_key] = (score, photo_url)
 
-        seen_paths.add(path_key)
-        photo_urls.append(photo_url)
+    for candidates in _parse_instagram_candidate_arrays(page_html):
+        best = max(
+            candidates,
+            key=lambda item: int(item.get("width", 0) or 0) * int(item.get("height", 0) or 0),
+        )
+        url = best.get("url")
+        if isinstance(url, str) and url:
+            consider(url)
 
-    return photo_urls
+    for raw_url in re.findall(
+        r"https://scontent[^\"'<> ]+?\.(?:jpg|jpeg|png|webp|heic|heif)\?[^\"'<> ]+",
+        page_html,
+        flags=re.IGNORECASE,
+    ):
+        consider(raw_url)
+
+    if not best_by_path:
+        return []
+
+    return [
+        url
+        for _, url in sorted(
+            best_by_path.values(),
+            key=lambda item: item[0],
+            reverse=True,
+        )
+    ]
 
 
-def download_file(url: str, destination: Path, referer: str) -> None:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Referer": referer,
-        },
-    )
+def extension_for_instagram_photo_url(url: str) -> str:
+    path = urlparse(url).path.lower()
+    for ext in (".heic", ".heif", ".jpeg", ".jpg", ".png", ".webp"):
+        if path.endswith(ext):
+            return ext.lstrip(".")
+    if "webp" in url.lower():
+        return "webp"
+    return "jpg"
+
+
+def download_file(
+    url: str,
+    destination: Path,
+    referer: str,
+    *,
+    cookie_header: str | None = None,
+) -> None:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": referer,
+    }
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+
+    request = Request(url, headers=headers)
 
     with urlopen(request, timeout=30, context=ssl._create_unverified_context()) as response:
         destination.write_bytes(response.read())
 
 
-def download_instagram_photos(url: str, output_path: Path, log: LogFn = _noop_log) -> int:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": INSTAGRAM_PAGE_USER_AGENT,
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.instagram.com/",
-        },
-    )
+def download_instagram_photos(
+    url: str,
+    output_path: Path,
+    log: LogFn = _noop_log,
+    *,
+    cookies_file: str | Path | None = None,
+) -> int:
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.instagram.com/",
+    }
+    cookie_header = cookie_header_from_file(cookies_file)
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+
+    request = Request(url, headers=headers)
 
     with urlopen(request, timeout=30, context=ssl._create_unverified_context()) as response:
         page_html = response.read().decode("utf-8", "replace")
@@ -426,17 +569,197 @@ def download_instagram_photos(url: str, output_path: Path, log: LogFn = _noop_lo
     downloaded_count = 0
 
     for index, photo_url in enumerate(photo_urls, start=1):
-        destination = output_path / f"{shortcode}_{index:02d}.jpg"
+        extension = extension_for_instagram_photo_url(photo_url)
+        destination = output_path / f"{shortcode}_{index:02d}.{extension}"
 
         if destination.exists():
             log(f"Фото уже есть: {destination}")
             continue
 
-        download_file(photo_url, destination, url)
+        download_file(photo_url, destination, url, cookie_header=cookie_header)
         downloaded_count += 1
         log(f"Фото скачано: {destination}")
 
     return downloaded_count
+
+
+def instagram_shortcode_to_media_id(shortcode: str) -> str | None:
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    media_id = 0
+    try:
+        for char in shortcode:
+            media_id = media_id * 64 + alphabet.index(char)
+    except ValueError:
+        return None
+    return str(media_id) if media_id else None
+
+
+def _instagram_audio_candidate_urls(asset: dict) -> list[str]:
+    urls: list[str] = []
+    for key in (
+        "progressive_download_url",
+        "fast_start_progressive_download_url",
+        "web_30s_preview_download_url",
+        "reactive_audio_download_url",
+    ):
+        value = asset.get(key)
+        if isinstance(value, str) and value.startswith("http"):
+            urls.append(value)
+
+    manifest = asset.get("dash_manifest")
+    if isinstance(manifest, str) and manifest.strip():
+        for match in re.finditer(r"<BaseURL>([^<]+)</BaseURL>", manifest):
+            url = html.unescape(match.group(1).strip())
+            if url.startswith("http"):
+                urls.append(url)
+    return urls
+
+
+def _instagram_music_assets_from_item(item: dict) -> list[dict]:
+    assets: list[dict] = []
+
+    music_metadata = item.get("music_metadata") or {}
+    music_info = music_metadata.get("music_info") or {}
+    if isinstance(music_info.get("music_asset_info"), dict):
+        assets.append(music_info["music_asset_info"])
+    if isinstance(music_metadata.get("original_sound_info"), dict):
+        assets.append(music_metadata["original_sound_info"])
+
+    clips = item.get("clips_metadata") or {}
+    if isinstance(clips.get("music_info"), dict) and isinstance(
+        clips["music_info"].get("music_asset_info"), dict
+    ):
+        assets.append(clips["music_info"]["music_asset_info"])
+    if isinstance(clips.get("original_sound_info"), dict):
+        assets.append(clips["original_sound_info"])
+
+    return assets
+
+
+def fetch_instagram_media_info(
+    url: str,
+    *,
+    cookies_file: str | Path | None = None,
+) -> dict | None:
+    shortcode = get_shortcode_from_url(url)
+    media_id = instagram_shortcode_to_media_id(shortcode)
+    if not media_id:
+        return None
+
+    cookie_header = cookie_header_from_file(cookies_file)
+    if not cookie_header:
+        return None
+
+    csrf = ""
+    for part in cookie_header.split("; "):
+        if part.startswith("csrftoken="):
+            csrf = part.split("=", 1)[1]
+            break
+
+    request = Request(
+        f"https://www.instagram.com/api/v1/media/{media_id}/info/",
+        headers={
+            "User-Agent": USER_AGENT,
+            "Cookie": cookie_header,
+            "Accept": "*/*",
+            "X-CSRFToken": csrf,
+            "X-IG-App-ID": "936619743392459",
+            "X-ASBD-ID": "129477",
+            "X-IG-WWW-Claim": "0",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": url if url.startswith("http") else f"https://www.instagram.com/p/{shortcode}/",
+        },
+    )
+    try:
+        with urlopen(request, timeout=30, context=ssl._create_unverified_context()) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list) or not items:
+        return None
+    item = items[0]
+    return item if isinstance(item, dict) else None
+
+
+def download_instagram_attached_audio(
+    url: str,
+    output_path: Path,
+    *,
+    cookies_file: str | Path | None = None,
+    log: LogFn = _noop_log,
+) -> list[Path]:
+    """Download music attached to a photo post / carousel when Instagram exposes a URL."""
+    item = fetch_instagram_media_info(url, cookies_file=cookies_file)
+    if not item:
+        return []
+
+    assets = _instagram_music_assets_from_item(item)
+    if not assets:
+        return []
+
+    cookie_header = cookie_header_from_file(cookies_file)
+    shortcode = get_shortcode_from_url(url)
+    output_path.mkdir(parents=True, exist_ok=True)
+    downloaded: list[Path] = []
+
+    for index, asset in enumerate(assets, start=1):
+        urls = _instagram_audio_candidate_urls(asset)
+        title = (
+            asset.get("title")
+            or asset.get("original_audio_title")
+            or asset.get("display_artist")
+            or ""
+        )
+        if not urls:
+            # Instagram often redacts licensed-music URLs for brand-new accounts
+            # even though music_metadata is present on the post.
+            log(
+                "У поста есть прикреплённая музыка"
+                + (f" ({title})" if title else "")
+                + ", но Instagram не отдал ссылку на аудиофайл. "
+                "На новых аккаунтах так бывает часто — нужен более «прогретый» аккаунт."
+            )
+            continue
+
+        audio_id = asset.get("id") or asset.get("audio_asset_id") or index
+        destination = output_path / f"{shortcode}_audio_{audio_id}.m4a"
+        if destination.exists():
+            downloaded.append(destination)
+            continue
+
+        last_error = None
+        for audio_url in urls:
+            temp = destination.with_suffix(".download")
+            try:
+                download_file(audio_url, temp, url, cookie_header=cookie_header)
+                # Instagram often serves music as audio-only MP4; remux to .m4a.
+                if temp.suffix.lower() != ".m4a":
+                    prepared = prepare_telegram_audio(temp, log)
+                    if prepared != temp and prepared.exists():
+                        prepared.replace(destination)
+                        temp.unlink(missing_ok=True)
+                    elif temp.exists():
+                        temp.replace(destination)
+                else:
+                    temp.replace(destination)
+
+                if destination.exists() and destination.stat().st_size > 0:
+                    downloaded.append(destination)
+                    log(
+                        f"Аудио скачано: {destination.name}"
+                        + (f" — {title}" if title else "")
+                    )
+                    break
+            except Exception as exc:
+                last_error = exc
+                temp.unlink(missing_ok=True)
+                destination.unlink(missing_ok=True)
+        else:
+            log(f"Не удалось скачать аудио поста: {last_error or 'нет рабочего URL'}")
+
+    return downloaded
 
 
 def download_photos_with_gallery_dl(
@@ -457,13 +780,10 @@ def download_photos_with_gallery_dl(
         "gallery_dl",
         "--no-colors",
         "--no-check-certificate",
+        "-o",
+        "extractor.instagram.audio=true",
         "--filter",
-        (
-            # Modern Instagram metadata often has no GraphQL `typename`.
-            # Keep still images only; skip video covers (`video_url` set).
-            # Source may be HEIC even when CDN delivers a JPEG (`stp=dst-jpg`).
-            "extension in ('jpg', 'jpeg', 'png', 'webp', 'heic', 'heif') and not video_url"
-        ),
+        GALLERY_DL_INSTAGRAM_FILTER,
         "-D",
         str(output_path),
         "-f",
@@ -476,7 +796,7 @@ def download_photos_with_gallery_dl(
     else:
         command[4:4] = ["--cookies-from-browser", cookies_browser]
 
-    log("Скачивание фото из Instagram-карусели...")
+    log("Скачивание фото и аудио из Instagram-карусели...")
 
     process = subprocess.Popen(
         command,
@@ -538,9 +858,18 @@ def probe_video_metadata(file_path: Path) -> VideoMetadata:
     audio_profile = profile_match.group(1) if profile_match else None
     has_audio = acodec is not None
 
+    duration = None
+    duration_match = _DURATION_RE.search(output)
+    if duration_match:
+        hours = int(duration_match.group(1))
+        minutes = int(duration_match.group(2))
+        seconds = float(duration_match.group(3))
+        duration = round(hours * 3600 + minutes * 60 + seconds)
+
     size_match = _VIDEO_STREAM_RE.search(output)
     if not size_match:
         return VideoMetadata(
+            duration=duration,
             vcodec=vcodec,
             acodec=acodec,
             audio_profile=audio_profile,
@@ -562,14 +891,6 @@ def probe_video_metadata(file_path: Path) -> VideoMetadata:
     rotation_match = _DISPLAY_MATRIX_ROTATION_RE.search(output) or _ROTATE_TAG_RE.search(output)
     if rotation_match and round(abs(float(rotation_match.group(1)))) % 180 == 90:
         width, height = height, width
-
-    duration = None
-    duration_match = _DURATION_RE.search(output)
-    if duration_match:
-        hours = int(duration_match.group(1))
-        minutes = int(duration_match.group(2))
-        seconds = float(duration_match.group(3))
-        duration = round(hours * 3600 + minutes * 60 + seconds)
 
     fps = None
     fps_match = _FPS_RE.search(output)
@@ -709,6 +1030,47 @@ def ensure_telegram_compatible_video(file_path: Path, log: LogFn = _noop_log) ->
     log(f"Файл готов для Telegram: {file_path.name}")
 
 
+def prepare_telegram_audio(file_path: Path, log: LogFn = _noop_log) -> Path:
+    """Remux Instagram music tracks to .m4a so Telegram sends them as audio."""
+    if file_path.suffix.lower() == ".m4a":
+        return file_path
+
+    ffmpeg_path = get_ffmpeg_path()
+    if not ffmpeg_path:
+        return file_path
+
+    dest = file_path.with_suffix(".m4a")
+    if dest.exists():
+        return dest
+
+    result = subprocess.run(
+        [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            str(file_path),
+            "-vn",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "160k",
+            "-ac",
+            "2",
+            str(dest),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    if result.returncode or not dest.exists():
+        log(f"Не удалось подготовить аудио {file_path.name}: {(result.stdout or '')[-300:]}")
+        return file_path
+
+    file_path.unlink(missing_ok=True)
+    log(f"Аудио готово для Telegram: {dest.name}")
+    return dest
+
+
 def cookies_file_has_sessionid(cookies_file: str | Path | None) -> bool:
     if not cookies_file:
         return False
@@ -725,6 +1087,100 @@ def cookies_file_has_sessionid(cookies_file: str | Path | None) -> bool:
     except OSError:
         return False
     return False
+
+
+def check_instagram_cookies_status(cookies_file: str | Path | None) -> str | None:
+    """Return None when cookies look usable, else a short status code.
+
+    Uses a public media info call rather than current_user: Instagram often
+    answers current_user with `useragent mismatch` even for a healthy session.
+    """
+    if not cookies_file_has_sessionid(cookies_file):
+        return "missing_sessionid"
+
+    cookie_header = cookie_header_from_file(cookies_file)
+    if not cookie_header:
+        return "missing_sessionid"
+
+    csrf = ""
+    for part in cookie_header.split("; "):
+        if part.startswith("csrftoken="):
+            csrf = part.split("=", 1)[1]
+            break
+
+    # Well-known public post — only used to probe whether the session is accepted.
+    request = Request(
+        "https://www.instagram.com/api/v1/media/3968676798661474844/info/",
+        headers={
+            "User-Agent": USER_AGENT,
+            "Cookie": cookie_header,
+            "X-CSRFToken": csrf,
+            "X-IG-App-ID": "936619743392459",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://www.instagram.com/",
+        },
+    )
+    try:
+        with urlopen(request, timeout=20, context=ssl._create_unverified_context()) as response:
+            if response.status == 200:
+                return None
+            return "invalid_session"
+    except Exception as exc:
+        body = b""
+        if hasattr(exc, "read"):
+            try:
+                body = exc.read()
+            except Exception:
+                body = b""
+        text = body.decode("utf-8", errors="replace")
+        if "checkpoint_required" in text:
+            return "checkpoint_required"
+        if "login_required" in text or "logged_out" in text:
+            return "invalid_session"
+        # Transient / UA quirks should not block downloads — gallery-dl/yt-dlp
+        # will surface a real failure if the session is actually dead.
+        return None
+
+
+def detect_instagram_auth_failure(messages: list[str] | str) -> str | None:
+    """Classify cookie/session failures from already collected download logs."""
+    text = messages if isinstance(messages, str) else "\n".join(messages)
+    lowered = text.lower()
+    if "checkpoint_required" in lowered or (
+        "checkpoint" in lowered and "подтвержд" in lowered
+    ):
+        return "checkpoint_required"
+    if (
+        "redirect to login" in lowered
+        or "accounts/login" in lowered
+        or "login_required" in lowered
+        or "logged_out" in lowered
+    ):
+        return "invalid_session"
+    if "нет sessionid" in lowered or "missing_sessionid" in lowered:
+        return "missing_sessionid"
+    return None
+
+
+def format_instagram_auth_error(status: str | None) -> str:
+    if status == "checkpoint_required":
+        return (
+            "Instagram требует подтверждение входа (checkpoint).\n"
+            "Cookies на месте, но сессия заблокирована, пока не подтвердишь в браузере:\n"
+            "1) Зайди в Instagram в Chrome под тем же аккаунтом\n"
+            "2) Пройди проверку («Это был ты?», SMS, captcha — что попросит)\n"
+            "3) Экспортируй новый instagram_cookies.txt и залей на сервер\n\n"
+            "Часто так бывает, когда cookies с домашнего IP, а бот работает с VPS."
+        )
+    if status == "missing_sessionid":
+        return (
+            "В instagram_cookies.txt нет sessionid.\n"
+            "Экспортируй cookies из браузера, где ты залогинен в Instagram."
+        )
+    return (
+        "Instagram cookies не принял — сессия недействительна.\n"
+        "Зайди в Instagram в браузере и экспортируй свежий cookies.txt."
+    )
 
 
 @dataclass
@@ -1175,6 +1631,15 @@ def download_instagram_media(
     emit(f"Cookies browser: {effective_cookies_browser or 'нет'}")
     emit(f"Cookies file: {cookies_file or youtube_cookies_file or 'нет'}")
 
+    # Only warn about missing sessionid up front. Hitting Instagram's API for a
+    # "session probe" burns fresh accounts and can trigger checkpoint before
+    # the real download even starts.
+    if is_instagram_url(url) and cookies_file and not cookies_file_has_sessionid(cookies_file):
+        emit(
+            "ВНИМАНИЕ: в Instagram cookies нет sessionid — "
+            "часто приходит видео без звука / фото не качаются."
+        )
+
     existing_media_files = get_media_files(output_path)
 
     try:
@@ -1227,16 +1692,49 @@ def download_instagram_media(
                         for path in (get_media_files(output_path) - files_before_gallery)
                         if is_image(path)
                     ]
-                    if gallery_result_code == 0 and gallery_images:
-                        emit(f"Фото из карусели обработаны: {len(gallery_images)}")
+                    gallery_audio = [
+                        path
+                        for path in (get_media_files(output_path) - files_before_gallery)
+                        if is_audio_only(path)
+                    ]
+                    if gallery_result_code == 0 and (gallery_images or gallery_audio):
+                        parts = []
+                        if gallery_images:
+                            parts.append(f"фото: {len(gallery_images)}")
+                        if gallery_audio:
+                            parts.append(f"аудио: {len(gallery_audio)}")
+                        emit(f"Карусель обработана ({', '.join(parts)})")
                     else:
                         gallery_result_code = 1
-                        emit("gallery-dl не смог скачать фото.")
+                        emit("gallery-dl не смог скачать фото и аудио.")
+
+                # gallery-dl often skips licensed music when Instagram redacts the URL.
+                # Try the media info API ourselves as a second chance.
+                if not any(
+                    is_audio_only(path)
+                    for path in (get_media_files(output_path) - files_before_gallery)
+                ):
+                    try:
+                        audio_files = download_instagram_attached_audio(
+                            url,
+                            output_path,
+                            cookies_file=effective_cookies_file or cookies_file,
+                            log=emit,
+                        )
+                        if audio_files:
+                            emit(f"Аудио к посту: {len(audio_files)}")
+                    except Exception as audio_error:
+                        emit(f"Не удалось отдельно скачать аудио: {audio_error}")
 
                 # Page scrape pulls video posters/covers — only for pure photo posts.
                 if photo_mode == "full" and gallery_result_code != 0:
                     try:
-                        photo_count = download_instagram_photos(url, output_path, emit)
+                        photo_count = download_instagram_photos(
+                            url,
+                            output_path,
+                            emit,
+                            cookies_file=effective_cookies_file or cookies_file,
+                        )
                         if photo_count:
                             emit(f"Фото сохранено: {photo_count}")
                     except Exception as photo_error:
@@ -1247,12 +1745,21 @@ def download_instagram_media(
         new_files = filter_video_thumbnails(
             sorted(get_media_files(output_path) - existing_media_files)
         )
+        prepared_files: list[Path] = []
         for file_path in new_files:
             if is_video(file_path):
                 ensure_telegram_compatible_video(file_path, emit)
+                prepared_files.append(file_path)
+            elif is_audio_only(file_path):
+                prepared_files.append(prepare_telegram_audio(file_path, emit))
+            else:
+                prepared_files.append(file_path)
+        new_files = sort_files_for_delivery(prepared_files)
         partial = bool(result_code) and bool(new_files)
         # yt-dlp exits non-zero on photo-only posts even when photos downloaded fine.
-        if partial and is_instagram_url(url) and new_files and all(is_image(path) for path in new_files):
+        if partial and is_instagram_url(url) and new_files and all(
+            is_image(path) or is_audio_only(path) for path in new_files
+        ):
             partial = False
 
         if not new_files:
@@ -1268,12 +1775,24 @@ def download_instagram_media(
                     "3) Положи как instagram_cookies.txt рядом с ботом\n"
                     "4) В .env укажи INSTAGRAM_COOKIES_FILE=.../instagram_cookies.txt и перезапусти бота"
                 )
-            elif is_instagram_url(url):
-                emit(
-                    "Не удалось скачать даже с cookies. "
-                    "Проверь, что пост открывается в браузере под этим аккаунтом и cookies не протухли."
+                return DownloadResult(
+                    files=[],
+                    messages=messages,
+                    error="Не удалось скачать медиа.",
+                    partial=False,
                 )
-            elif youtube and is_youtube_age_gate_error(joined):
+            if is_instagram_url(url):
+                auth_status = detect_instagram_auth_failure(joined) or check_instagram_cookies_status(
+                    cookies_file
+                )
+                emit(format_instagram_auth_error(auth_status))
+                return DownloadResult(
+                    files=[],
+                    messages=messages,
+                    error=f"instagram_auth:{auth_status or 'invalid_session'}",
+                    partial=False,
+                )
+            if youtube and is_youtube_age_gate_error(joined):
                 emit(
                     format_age_gate_error(
                         bool(effective_cookies_file)

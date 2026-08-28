@@ -1,6 +1,6 @@
 # YouTube needs the EJS challenge solver scripts from the default extra,
 # plus a JS runtime (Deno) available in PATH.
-yt-dlp[default]>=2026.7.4
+yt-dlp[default]>=2026.8.19
 imageio-ffmpeg>=0.5.1
 gallery-dl>=1.27.0
 python-telegram-bot>=21

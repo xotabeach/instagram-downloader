@@ -25,6 +25,7 @@ except ImportError as e:
 try:
     from yt_dlp import YoutubeDL
     from yt_dlp.utils import DownloadError
+    from instagram_core import GALLERY_DL_INSTAGRAM_FILTER
 except ImportError:
     print(
         "Не установлен yt-dlp для этого Python.\n"
@@ -461,8 +462,10 @@ class InstagramDownloaderApp:
             "--no-check-certificate",
             "--cookies-from-browser",
             selected_browser,
+            "-o",
+            "extractor.instagram.audio=true",
             "--filter",
-            "extension in ('jpg', 'jpeg', 'png', 'webp', 'heic', 'heif') and not video_url",
+            GALLERY_DL_INSTAGRAM_FILTER,
             "-D",
             str(output_path),
             "-f",
@@ -470,7 +473,7 @@ class InstagramDownloaderApp:
             url,
         ]
 
-        self.log_queue.put("Скачивание фото из Instagram-карусели...")
+        self.log_queue.put("Скачивание фото и аудио из Instagram-карусели...")
 
         process = subprocess.Popen(
             command,
