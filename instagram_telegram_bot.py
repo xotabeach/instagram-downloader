@@ -482,7 +482,7 @@ def format_cookies_status() -> str:
     return "\n".join(lines)
 
 
-async def notify_admin_cookies_dead(context_or_bot, reason: str) -> None:
+async def notify_admin_cookies_dead(bot, reason: str) -> None:
     if not AUTHORIZED_USER_IDS:
         return
     state = load_cookies_state()
@@ -495,7 +495,6 @@ async def notify_admin_cookies_dead(context_or_bot, reason: str) -> None:
     ):
         return
 
-    bot = getattr(context_or_bot, "bot", context_or_bot)
     text = (
         "Instagram cookies слетели.\n"
         f"Причина: {reason}\n\n"
