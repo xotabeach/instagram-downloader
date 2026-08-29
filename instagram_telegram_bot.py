@@ -91,8 +91,9 @@ YOUTUBE_COOKIES_BROWSER = os.getenv("YOUTUBE_COOKIES_FROM_BROWSER", "").strip() 
 YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "").strip() or None
 SEND_PREVIEW = env_bool("TELEGRAM_SEND_PREVIEW", True)
 SEND_DOCUMENT = env_bool("TELEGRAM_SEND_DOCUMENT", False)
-# Telegram compresses reply_photo; documents keep the original pixels and aspect ratio.
-PHOTO_PREVIEW = env_bool("TELEGRAM_PHOTO_PREVIEW", False)
+# Telegram compresses reply_photo; set TELEGRAM_PHOTO_PREVIEW=false to send
+# originals as documents instead (full resolution / aspect ratio).
+PHOTO_PREVIEW = env_bool("TELEGRAM_PHOTO_PREVIEW", True)
 AUTH_QUESTION = (
     os.getenv("TELEGRAM_AUTH_QUESTION", "").strip()
     or "Как зовут автора бота?"
@@ -588,7 +589,7 @@ def welcome_text() -> str:
         "• YouTube — выбор качества (1080p/720p/480p/360p), до 20 минут\n"
         "• видео — в исходном разрешении и соотношении сторон\n"
         "• если файл больше ~50 MB — предложу сжать\n"
-        "• фото — файлом в исходном разрешении (или превью, если включить TELEGRAM_PHOTO_PREVIEW)\n"
+        "• фото — превью в чате (для оригинала без сжатия: TELEGRAM_PHOTO_PREVIEW=false)\n"
         "• карусель — фото листаются вместе (до 10 в сообщении)\n"
         "После видео — случайный анекдот категории Б.\n"
         "Админ: /stats, /cookies (можно прислать cookies.txt файлом)."
