@@ -1782,14 +1782,22 @@ def download_instagram_media(
                     partial=False,
                 )
             if is_instagram_url(url):
-                auth_status = detect_instagram_auth_failure(joined) or check_instagram_cookies_status(
-                    cookies_file
-                )
-                emit(format_instagram_auth_error(auth_status))
+                # Only blame cookies when logs clearly show login/checkpoint.
+                # Probing the API on every unrelated failure also burns sessions
+                # and used to mark JSON/rate-limit errors as "cookies dead".
+                auth_status = detect_instagram_auth_failure(joined)
+                if auth_status:
+                    emit(format_instagram_auth_error(auth_status))
+                    return DownloadResult(
+                        files=[],
+                        messages=messages,
+                        error=f"instagram_auth:{auth_status}",
+                        partial=False,
+                    )
                 return DownloadResult(
                     files=[],
                     messages=messages,
-                    error=f"instagram_auth:{auth_status or 'invalid_session'}",
+                    error="Не удалось скачать медиа.",
                     partial=False,
                 )
             if youtube and is_youtube_age_gate_error(joined):

@@ -477,8 +477,10 @@ def format_cookies_status() -> str:
         )
     lines.append("")
     lines.append(
-        "Чтобы обновить — просто пришли сюда файл cookies.txt "
-        "(экспорт «Get cookies.txt LOCALLY»). Бот сам поймёт Instagram или YouTube."
+        "Arc на macOS ок (это Chromium): экспортируй тем же "
+        "«Get cookies.txt LOCALLY» с сайта instagram.com.\n"
+        "Важно: пока залогинен в Arc, не разлогинивайся — иначе sessionid на сервере умрёт.\n"
+        "Чтобы обновить — пришли сюда cookies.txt файлом."
     )
     return "\n".join(lines)
 
@@ -1010,6 +1012,9 @@ async def run_download(
                     auth_error = str(result.error).split(":", 1)[1]
                 else:
                     auth_error = detect_instagram_auth_failure(result.messages)
+                # Ignore empty / unknown auth tags from older code paths.
+                if auth_error in {"", "None", None}:
+                    auth_error = None
 
             if auth_error:
                 reason = {
