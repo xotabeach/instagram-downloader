@@ -427,11 +427,10 @@ def ensure_cookie_pool() -> None:
 def cookie_slot_paths() -> list[Path]:
     ensure_cookie_pool()
     paths = [COOKIES_DIR / f"{index}.txt" for index in range(1, COOKIE_SLOTS + 1)]
-    # Keep legacy single-file path as an extra slot if it's outside the pool dir.
-    if COOKIES_FILE:
-        legacy = Path(COOKIES_FILE).expanduser().resolve()
-        pool_resolved = {path.resolve() for path in paths}
-        if legacy.exists() and legacy.resolve() not in pool_resolved:
+    # Legacy single-file path only if the pool itself is still empty.
+    if COOKIES_FILE and not any(path.exists() for path in paths):
+        legacy = Path(COOKIES_FILE).expanduser()
+        if legacy.exists():
             paths.append(legacy)
     return paths
 
