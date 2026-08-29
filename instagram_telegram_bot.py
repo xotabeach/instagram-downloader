@@ -44,6 +44,7 @@ from instagram_core import (
     estimate_compress_for_file,
     extract_media_url,
     format_mb,
+    get_media_files,
     inspect_youtube_video,
     is_audio_only,
     is_image,
@@ -73,6 +74,16 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not str(value).strip():
+        return default
+    try:
+        return int(str(value).strip())
+    except ValueError:
+        return default
+
+
 def load_category_b_jokes() -> list[str]:
     if not JOKES_PATH.exists():
         return []
@@ -87,6 +98,15 @@ def load_category_b_jokes() -> list[str]:
 
 COOKIES_BROWSER = os.getenv("INSTAGRAM_COOKIES_FROM_BROWSER", "").strip() or None
 COOKIES_FILE = os.getenv("INSTAGRAM_COOKIES_FILE", "").strip() or None
+COOKIES_DIR = Path(
+    os.getenv("INSTAGRAM_COOKIES_DIR", "").strip()
+    or str(Path(__file__).with_name("instagram_cookies"))
+).expanduser()
+COOKIE_SLOTS = max(1, min(env_int("INSTAGRAM_COOKIE_SLOTS", 5), 10))
+IG_MAX_PER_HOUR = max(1, env_int("INSTAGRAM_MAX_DOWNLOADS_PER_HOUR", 20))
+IG_MIN_INTERVAL_SECONDS = max(0, env_int("INSTAGRAM_MIN_INTERVAL_SECONDS", 25))
+# Dead slots stay skipped this long unless admin re-uploads them.
+COOKIE_DEAD_COOLDOWN_SECONDS = max(60, env_int("INSTAGRAM_COOKIE_DEAD_COOLDOWN_SECONDS", 6 * 3600))
 YOUTUBE_COOKIES_BROWSER = os.getenv("YOUTUBE_COOKIES_FROM_BROWSER", "").strip() or None
 YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "").strip() or None
 SEND_PREVIEW = env_bool("TELEGRAM_SEND_PREVIEW", True)
@@ -108,6 +128,9 @@ CATEGORY_B_JOKES = load_category_b_jokes()
 _pending_auth: set[int] = set()
 _pending_jobs: dict[str, "PendingJob"] = {}
 _heavy_lock = asyncio.Lock()
+_ig_rate_lock = asyncio.Lock()
+_ig_download_times: list[float] = []
+_ig_cookie_rr = 0
 
 
 @dataclass
@@ -359,12 +382,16 @@ def is_admin(user_id: int | None) -> bool:
 
 def load_cookies_state() -> dict:
     if not COOKIES_STATE_PATH.exists():
-        return {}
+        return {"slots": {}, "rr": 0}
     try:
         data = json.loads(COOKIES_STATE_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        return {"slots": {}, "rr": 0}
+    if not isinstance(data, dict):
+        return {"slots": {}, "rr": 0}
+    data.setdefault("slots", {})
+    data.setdefault("rr", 0)
+    return data
 
 
 def save_cookies_state(data: dict) -> None:
@@ -383,6 +410,144 @@ def cookies_mtime_iso(path: str | Path | None) -> str | None:
     return datetime.fromtimestamp(file_path.stat().st_mtime, timezone.utc).replace(
         microsecond=0
     ).isoformat()
+
+
+def ensure_cookie_pool() -> None:
+    """Create pool dir and migrate legacy INSTAGRAM_COOKIES_FILE into slot 1."""
+    COOKIES_DIR.mkdir(parents=True, exist_ok=True)
+    slot1 = COOKIES_DIR / "1.txt"
+    if slot1.exists():
+        return
+    if COOKIES_FILE:
+        legacy = Path(COOKIES_FILE).expanduser()
+        if legacy.exists() and cookies_file_has_sessionid(legacy):
+            slot1.write_bytes(legacy.read_bytes())
+
+
+def cookie_slot_paths() -> list[Path]:
+    ensure_cookie_pool()
+    paths = [COOKIES_DIR / f"{index}.txt" for index in range(1, COOKIE_SLOTS + 1)]
+    # Keep legacy single-file path as an extra slot if it's outside the pool dir.
+    if COOKIES_FILE:
+        legacy = Path(COOKIES_FILE).expanduser().resolve()
+        pool_resolved = {path.resolve() for path in paths}
+        if legacy.exists() and legacy.resolve() not in pool_resolved:
+            paths.append(legacy)
+    return paths
+
+
+def cookie_slot_key(path: Path) -> str:
+    return str(path.resolve())
+
+
+def cookie_slot_label(path: Path) -> str:
+    try:
+        if path.parent.resolve() == COOKIES_DIR.resolve():
+            return path.stem
+    except OSError:
+        pass
+    return path.name
+
+
+def is_cookie_slot_dead(path: Path, state: dict | None = None) -> bool:
+    state = state or load_cookies_state()
+    entry = (state.get("slots") or {}).get(cookie_slot_key(path)) or {}
+    dead_until = entry.get("dead_until")
+    if not dead_until:
+        return False
+    try:
+        until = datetime.fromisoformat(dead_until)
+    except ValueError:
+        return False
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) < until
+
+
+def mark_cookie_slot_dead(path: Path, reason: str) -> None:
+    state = load_cookies_state()
+    slots = state.setdefault("slots", {})
+    key = cookie_slot_key(path)
+    dead_until = datetime.now(timezone.utc).timestamp() + COOKIE_DEAD_COOLDOWN_SECONDS
+    slots[key] = {
+        "dead_until": datetime.fromtimestamp(dead_until, timezone.utc)
+        .replace(microsecond=0)
+        .isoformat(),
+        "last_error": reason,
+        "marked_at": utc_now_iso(),
+    }
+    save_cookies_state(state)
+
+
+def revive_cookie_slot(path: Path) -> None:
+    state = load_cookies_state()
+    slots = state.setdefault("slots", {})
+    key = cookie_slot_key(path)
+    if key in slots:
+        slots[key] = {
+            "dead_until": None,
+            "last_error": None,
+            "marked_at": None,
+            "revived_at": utc_now_iso(),
+        }
+        save_cookies_state(state)
+
+
+def list_alive_cookie_slots() -> list[Path]:
+    state = load_cookies_state()
+    alive: list[Path] = []
+    for path in cookie_slot_paths():
+        if not path.exists():
+            continue
+        if not cookies_file_has_sessionid(path):
+            continue
+        if is_cookie_slot_dead(path, state):
+            continue
+        alive.append(path)
+    return alive
+
+
+def pick_cookie_slot(exclude: set[Path] | None = None) -> Path | None:
+    global _ig_cookie_rr
+    alive = list_alive_cookie_slots()
+    if exclude:
+        alive = [path for path in alive if path.resolve() not in {p.resolve() for p in exclude}]
+    if not alive:
+        return None
+    state = load_cookies_state()
+    start = int(state.get("rr") or _ig_cookie_rr or 0) % len(alive)
+    path = alive[start]
+    state["rr"] = (start + 1) % len(alive)
+    _ig_cookie_rr = state["rr"]
+    save_cookies_state(state)
+    return path
+
+
+def prune_ig_rate_times(now: float | None = None) -> list[float]:
+    global _ig_download_times
+    now = time.monotonic() if now is None else now
+    cutoff = now - 3600
+    _ig_download_times = [stamp for stamp in _ig_download_times if stamp >= cutoff]
+    return _ig_download_times
+
+
+def ig_rate_limit_wait_seconds() -> int:
+    """Return seconds to wait, or 0 if a download is allowed now."""
+    now = time.monotonic()
+    stamps = prune_ig_rate_times(now)
+    if IG_MIN_INTERVAL_SECONDS and stamps:
+        since_last = now - stamps[-1]
+        if since_last < IG_MIN_INTERVAL_SECONDS:
+            return int(IG_MIN_INTERVAL_SECONDS - since_last) + 1
+    if len(stamps) >= IG_MAX_PER_HOUR:
+        return int(stamps[0] + 3600 - now) + 1
+    return 0
+
+
+def record_ig_download_attempt() -> None:
+    now = time.monotonic()
+    prune_ig_rate_times(now)
+    _ig_download_times.append(now)
 
 
 def netscape_cookie_names(text: str, domain_needle: str) -> set[str]:
@@ -439,37 +604,68 @@ def install_cookies_file(target: str | Path, content: bytes) -> Path:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_bytes(content)
     tmp.replace(path)
+    revive_cookie_slot(path)
     state = load_cookies_state()
     state["last_upload_at"] = utc_now_iso()
     state["last_alert_at"] = None
     state["last_alert_reason"] = None
-    state["cookies_mtime"] = cookies_mtime_iso(path)
     save_cookies_state(state)
     return path
 
 
-def format_cookies_status() -> str:
-    ig_path = Path(COOKIES_FILE).expanduser() if COOKIES_FILE else None
-    yt_path = Path(YOUTUBE_COOKIES_FILE).expanduser() if YOUTUBE_COOKIES_FILE else None
+def install_instagram_cookies_to_pool(content: bytes) -> Path:
+    """Put cookies into an empty/dead pool slot, else overwrite next round-robin slot."""
+    ensure_cookie_pool()
     state = load_cookies_state()
-    lines = ["Cookies"]
-    if ig_path:
-        exists = ig_path.exists()
-        has_sid = cookies_file_has_sessionid(ig_path) if exists else False
+    pool_paths = [COOKIES_DIR / f"{index}.txt" for index in range(1, COOKIE_SLOTS + 1)]
+
+    for path in pool_paths:
+        if not path.exists():
+            return install_cookies_file(path, content)
+
+    for path in pool_paths:
+        if is_cookie_slot_dead(path, state) or not cookies_file_has_sessionid(path):
+            return install_cookies_file(path, content)
+
+    index = int(state.get("rr") or 0) % len(pool_paths)
+    return install_cookies_file(pool_paths[index], content)
+
+
+def format_cookies_status() -> str:
+    ensure_cookie_pool()
+    state = load_cookies_state()
+    lines = [
+        "Instagram cookie pool",
+        f"Лимит: ≤{IG_MAX_PER_HOUR}/час, пауза ≥{IG_MIN_INTERVAL_SECONDS}с (на весь бот)",
+    ]
+    alive = 0
+    for path in [COOKIES_DIR / f"{index}.txt" for index in range(1, COOKIE_SLOTS + 1)]:
+        label = cookie_slot_label(path)
+        if not path.exists():
+            lines.append(f"• слот {label}: пусто")
+            continue
+        has_sid = cookies_file_has_sessionid(path)
+        dead = is_cookie_slot_dead(path, state)
+        entry = (state.get("slots") or {}).get(cookie_slot_key(path)) or {}
+        if has_sid and not dead:
+            alive += 1
+            status = "живой"
+        elif dead:
+            status = f"мёртвый до {entry.get('dead_until', '?')}"
+        else:
+            status = "нет sessionid"
         lines.append(
-            f"Instagram: {'есть' if exists else 'нет файла'}"
-            + (f", sessionid={'ок' if has_sid else 'нет'}" if exists else "")
-            + (f", обновлён {cookies_mtime_iso(ig_path)}" if exists else "")
+            f"• слот {label}: {status}, обновлён {cookies_mtime_iso(path) or '—'}"
         )
-    else:
-        lines.append("Instagram: путь не задан в .env")
+    lines.append(f"Живых слотов: {alive}/{COOKIE_SLOTS}")
+
+    yt_path = Path(YOUTUBE_COOKIES_FILE).expanduser() if YOUTUBE_COOKIES_FILE else None
     if yt_path:
         lines.append(
             f"YouTube: {'есть' if yt_path.exists() else 'нет файла'}"
             + (f", обновлён {cookies_mtime_iso(yt_path)}" if yt_path.exists() else "")
         )
-    else:
-        lines.append("YouTube: не задан")
+
     if state.get("last_alert_at"):
         lines.append(
             f"Последний алерт: {state['last_alert_at']}"
@@ -477,10 +673,8 @@ def format_cookies_status() -> str:
         )
     lines.append("")
     lines.append(
-        "Arc на macOS ок (это Chromium): экспортируй тем же "
-        "«Get cookies.txt LOCALLY» с сайта instagram.com.\n"
-        "Важно: пока залогинен в Arc, не разлогинивайся — иначе sessionid на сервере умрёт.\n"
-        "Чтобы обновить — пришли сюда cookies.txt файлом."
+        "Пришли cookies.txt файлом — попадёт в пул (пустой/мёртвый слот, иначе next).\n"
+        "Пул общий для всех пользователей бота. Не разлогинивайся в браузере после экспорта."
     )
     return "\n".join(lines)
 
@@ -489,21 +683,28 @@ async def notify_admin_cookies_dead(bot, reason: str) -> None:
     if not AUTHORIZED_USER_IDS:
         return
     state = load_cookies_state()
-    current_mtime = cookies_mtime_iso(COOKIES_FILE)
-    # Don't spam: one alert until cookies are replaced.
+    alive = list_alive_cookie_slots()
+    # Don't spam while the pool fingerprint is unchanged.
+    fingerprint = "|".join(
+        f"{cookie_slot_label(path)}:{cookies_mtime_iso(path)}"
+        for path in cookie_slot_paths()
+        if path.exists()
+    )
     if (
         state.get("last_alert_at")
-        and state.get("cookies_mtime") == current_mtime
+        and state.get("pool_fingerprint") == fingerprint
         and state.get("last_alert_reason") == reason
+        and not alive
     ):
         return
 
     text = (
-        "Instagram cookies слетели.\n"
-        f"Причина: {reason}\n\n"
+        "Instagram cookies: проблема с пулом.\n"
+        f"Причина: {reason}\n"
+        f"Живых слотов: {len(alive)}/{COOKIE_SLOTS}\n\n"
         "Пришли новый cookies.txt сюда файлом "
-        "(Chrome → «Get cookies.txt LOCALLY» → Export).\n"
-        "Или /cookies чтобы глянуть статус."
+        "(Get cookies.txt LOCALLY → Export).\n"
+        "/cookies — статус пула."
     )
     try:
         await bot.send_message(chat_id=AUTHORIZED_USER_IDS[0], text=text)
@@ -512,7 +713,7 @@ async def notify_admin_cookies_dead(bot, reason: str) -> None:
 
     state["last_alert_at"] = utc_now_iso()
     state["last_alert_reason"] = reason
-    state["cookies_mtime"] = current_mtime
+    state["pool_fingerprint"] = fingerprint
     save_cookies_state(state)
 
 
@@ -594,7 +795,7 @@ def welcome_text() -> str:
         "• фото — превью в чате (для оригинала без сжатия: TELEGRAM_PHOTO_PREVIEW=false)\n"
         "• карусель — фото листаются вместе (до 10 в сообщении)\n"
         "После видео — случайный анекдот категории Б.\n"
-        "Админ: /stats, /cookies (можно прислать cookies.txt файлом)."
+        "Админ: /stats, /cookies (пул cookies.txt + лимит Instagram)."
     )
 
 
@@ -683,15 +884,14 @@ async def handle_cookies_document(update: Update, context: ContextTypes.DEFAULT_
         return
 
     if platform == "instagram":
-        if not COOKIES_FILE:
-            await message.reply_text("INSTAGRAM_COOKIES_FILE не задан в .env на сервере.")
-            return
-        path = install_cookies_file(COOKIES_FILE, raw)
+        path = install_instagram_cookies_to_pool(raw)
+        alive = len(list_alive_cookie_slots())
         await message.reply_text(
-            f"Instagram cookies обновлены.\n"
-            f"Файл: {path}\n"
+            f"Instagram cookies добавлены в пул.\n"
+            f"Слот: {cookie_slot_label(path)}\n"
             f"sessionid: ок\n"
-            "Можно снова кидать ссылки — рестарт бота не нужен."
+            f"Живых слотов: {alive}/{COOKIE_SLOTS}\n"
+            "Рестарт бота не нужен — пул общий для всех пользователей."
         )
         return
 
@@ -987,20 +1187,86 @@ async def run_download(
 ) -> None:
     workdir = Path(tempfile.mkdtemp(prefix="ig_tg_"))
     try:
+        if is_instagram_url(url):
+            async with _ig_rate_lock:
+                wait_for = ig_rate_limit_wait_seconds()
+                if wait_for > 0:
+                    cleanup_workdir(workdir)
+                    await status.edit_text(
+                        f"Слишком часто качаем Instagram (лимит на весь бот).\n"
+                        f"Подожди ~{max(wait_for // 60, 1)} мин и попробуй снова.\n"
+                        f"Сейчас: ≤{IG_MAX_PER_HOUR}/час, пауза ≥{IG_MIN_INTERVAL_SECONDS}с."
+                    )
+                    return
+                record_ig_download_attempt()
+
         if _heavy_lock.locked():
             await status.edit_text("Подожди, обрабатывается другое видео...")
         async with _heavy_lock:
             await reply_target.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-            result = await asyncio.to_thread(
-                download_instagram_media,
-                url,
-                workdir,
-                cookies_browser=COOKIES_BROWSER,
-                cookies_file=COOKIES_FILE,
-                youtube_cookies_browser=YOUTUBE_COOKIES_BROWSER,
-                youtube_cookies_file=YOUTUBE_COOKIES_FILE,
-                max_height=max_height,
-            )
+
+            result = None
+            tried: set[Path] = set()
+            cookies_file = COOKIES_FILE
+            if is_instagram_url(url):
+                while True:
+                    slot = pick_cookie_slot(exclude=tried)
+                    if slot is None:
+                        break
+                    tried.add(slot.resolve())
+                    await status.edit_text(
+                        f"Скачиваю (cookies слот {cookie_slot_label(slot)})..."
+                    )
+                    result = await asyncio.to_thread(
+                        download_instagram_media,
+                        url,
+                        workdir,
+                        cookies_browser=COOKIES_BROWSER,
+                        cookies_file=str(slot),
+                        youtube_cookies_browser=YOUTUBE_COOKIES_BROWSER,
+                        youtube_cookies_file=YOUTUBE_COOKIES_FILE,
+                        max_height=max_height,
+                    )
+                    if result.files:
+                        break
+                    auth_error = None
+                    if result.error and str(result.error).startswith("instagram_auth:"):
+                        auth_error = str(result.error).split(":", 1)[1]
+                    else:
+                        auth_error = detect_instagram_auth_failure(result.messages)
+                    if not auth_error:
+                        break
+                    mark_cookie_slot_dead(slot, auth_error)
+                    # Clear partial junk before trying the next account cookies.
+                    for leftover in get_media_files(workdir):
+                        leftover.unlink(missing_ok=True)
+                    if not list_alive_cookie_slots():
+                        break
+                    await status.edit_text(
+                        f"Слот {cookie_slot_label(slot)} отклонён Instagram, пробую другой..."
+                    )
+                if result is None:
+                    result = await asyncio.to_thread(
+                        download_instagram_media,
+                        url,
+                        workdir,
+                        cookies_browser=COOKIES_BROWSER,
+                        cookies_file=cookies_file,
+                        youtube_cookies_browser=YOUTUBE_COOKIES_BROWSER,
+                        youtube_cookies_file=YOUTUBE_COOKIES_FILE,
+                        max_height=max_height,
+                    )
+            else:
+                result = await asyncio.to_thread(
+                    download_instagram_media,
+                    url,
+                    workdir,
+                    cookies_browser=COOKIES_BROWSER,
+                    cookies_file=COOKIES_FILE,
+                    youtube_cookies_browser=YOUTUBE_COOKIES_BROWSER,
+                    youtube_cookies_file=YOUTUBE_COOKIES_FILE,
+                    max_height=max_height,
+                )
 
         if not result.files:
             details = "\n".join(result.messages[-8:]) if result.messages else (result.error or "unknown")
@@ -1012,7 +1278,6 @@ async def run_download(
                     auth_error = str(result.error).split(":", 1)[1]
                 else:
                     auth_error = detect_instagram_auth_failure(result.messages)
-                # Ignore empty / unknown auth tags from older code paths.
                 if auth_error in {"", "None", None}:
                     auth_error = None
 
@@ -1023,17 +1288,18 @@ async def run_download(
                     "missing_sessionid": "нет sessionid в cookies",
                 }.get(auth_error, auth_error)
                 await notify_admin_cookies_dead(reply_target.get_bot(), reason)
+                alive = len(list_alive_cookie_slots())
                 if is_admin(user_id):
                     await status.edit_text(
-                        "Instagram cookies слетели.\n"
-                        f"Причина: {reason}\n\n"
-                        "Пришли новый cookies.txt сюда файлом "
-                        "(Chrome → Get cookies.txt LOCALLY → Export).\n"
+                        "Instagram cookies: пул не смог скачать.\n"
+                        f"Причина: {reason}\n"
+                        f"Живых слотов: {alive}/{COOKIE_SLOTS}\n\n"
+                        "Пришли новый cookies.txt сюда файлом.\n"
                         "/cookies — статус."
                     )
                 else:
                     await status.edit_text(
-                        "Сейчас Instagram не пускает (сессия бота слетела).\n"
+                        "Сейчас Instagram не пускает (сессии бота).\n"
                         "Админ уже уведомлён — попробуй позже."
                     )
             else:
@@ -1240,16 +1506,14 @@ def main() -> None:
             "python3 instagram_telegram_bot.py"
         )
 
-    if COOKIES_FILE and not Path(COOKIES_FILE).expanduser().exists():
-        raise SystemExit(
-            f"Файл cookies не найден: {COOKIES_FILE}\n\n"
-            "Для фото Instagram нужен cookies.txt:\n"
-            "1) Зайди в Instagram в Chrome\n"
-            "2) Расширением «Get cookies.txt LOCALLY» экспортируй cookies\n"
-            f"3) Сохрани файл сюда: {COOKIES_FILE}\n"
-            "4) Запусти бота снова\n\n"
-            "Либо временно убери INSTAGRAM_COOKIES_FILE из .env "
-            "(тогда сработают в основном только видео/TikTok)."
+    ensure_cookie_pool()
+    alive_slots = list_alive_cookie_slots()
+    if not alive_slots:
+        print(
+            "ВНИМАНИЕ: в пуле Instagram cookies нет живых слотов.\n"
+            f"Папка пула: {COOKIES_DIR}\n"
+            "Пришли cookies.txt боту (админ) или положи файлы "
+            f"{COOKIES_DIR}/1.txt … {COOKIE_SLOTS}.txt"
         )
 
     # Only age-restricted videos need this file, so a missing one is a warning:
@@ -1273,7 +1537,11 @@ def main() -> None:
 
     print("Instagram Telegram bot started.")
     print(f"Instagram cookies browser: {COOKIES_BROWSER or 'нет'}")
-    print(f"Instagram cookies file: {COOKIES_FILE or 'нет'}")
+    print(f"Instagram cookies pool: {COOKIES_DIR} ({len(alive_slots)}/{COOKIE_SLOTS} alive)")
+    print(
+        f"Instagram rate limit: ≤{IG_MAX_PER_HOUR}/hour, "
+        f"min interval {IG_MIN_INTERVAL_SECONDS}s"
+    )
     print(f"YouTube cookies browser: {YOUTUBE_COOKIES_BROWSER or 'нет'}")
     print(f"YouTube cookies file: {YOUTUBE_COOKIES_FILE or 'нет'}")
     print(f"Auth question: {AUTH_QUESTION}")

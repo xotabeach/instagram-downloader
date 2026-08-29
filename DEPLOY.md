@@ -111,6 +111,7 @@ rsync -avz \
   --exclude '__pycache__' \
   --exclude 'instagram_telegram_bot.env' \
   --exclude 'instagram_cookies.txt' \
+  --exclude 'instagram_cookies' \
   --exclude 'youtube_cookies.txt' \
   --exclude 'youtube_cookies.txt' \
   --exclude 'authorized_users.json' \
