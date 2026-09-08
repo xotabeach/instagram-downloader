@@ -688,6 +688,82 @@ def format_cookies_status() -> str:
     return "\n".join(lines)
 
 
+def cookies_manage_keyboard() -> InlineKeyboardMarkup | None:
+    state = load_cookies_state()
+    rows = []
+    for path in [COOKIES_DIR / f"{index}.txt" for index in range(1, COOKIE_SLOTS + 1)]:
+        if not path.exists():
+            continue
+        label = cookie_slot_label(path)
+        if is_cookie_slot_dead(path, state):
+            marker = "💀"
+        elif not cookies_file_has_sessionid(path):
+            marker = "❓"
+        else:
+            marker = "✅"
+        rows.append(
+            [InlineKeyboardButton(f"🗑 Удалить слот {label} {marker}", callback_data=f"cxask:{label}")]
+        )
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
+def delete_cookie_slot(path: Path) -> None:
+    path.unlink(missing_ok=True)
+    state = load_cookies_state()
+    (state.get("slots") or {}).pop(cookie_slot_key(path), None)
+    save_cookies_state(state)
+
+
+async def handle_cookies_callback(query, user, action: str, label: str) -> None:
+    if not is_admin(user.id):
+        await query.edit_message_text("Команда только для админа.")
+        return
+
+    if action == "cxback":
+        await query.edit_message_text(
+            format_cookies_status(), reply_markup=cookies_manage_keyboard()
+        )
+        return
+
+    if not label.isalnum():
+        await query.edit_message_text("Неизвестный слот.")
+        return
+    path = COOKIES_DIR / f"{label}.txt"
+
+    if action == "cxask":
+        if not path.exists():
+            await query.edit_message_text(
+                format_cookies_status(), reply_markup=cookies_manage_keyboard()
+            )
+            return
+        await query.edit_message_text(
+            f"Удалить cookies слота {label}? Файл удалится с диска, "
+            "понадобится новый cookies.txt для этого слота.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("Да, удалить", callback_data=f"cxyes:{label}"),
+                        InlineKeyboardButton("Отмена", callback_data=f"cxback:{label}"),
+                    ]
+                ]
+            ),
+        )
+        return
+
+    if action == "cxyes":
+        if path.exists():
+            delete_cookie_slot(path)
+            prefix = f"Слот {label} удалён.\n\n"
+        else:
+            prefix = f"Слот {label} уже пуст.\n\n"
+        await query.edit_message_text(
+            prefix + format_cookies_status(), reply_markup=cookies_manage_keyboard()
+        )
+        return
+
+    await query.edit_message_text("Эта кнопка уже не действует.")
+
+
 async def notify_admin_cookies_dead(bot, reason: str) -> None:
     if not AUTHORIZED_USER_IDS:
         return
@@ -846,7 +922,7 @@ async def cookies_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not is_admin(user.id):
         await message.reply_text("Команда только для админа.")
         return
-    await message.reply_text(format_cookies_status())
+    await message.reply_text(format_cookies_status(), reply_markup=cookies_manage_keyboard())
 
 
 async def handle_cookies_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1440,6 +1516,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     action, job_id = parts[0], parts[1]
+
+    if action in {"cxask", "cxyes", "cxback"}:
+        await handle_cookies_callback(query, user, action, job_id)
+        return
+
     job = _pending_jobs.get(job_id)
     if not job or job.user_id != user.id:
         await query.edit_message_text("Эта кнопка уже не действует.")
