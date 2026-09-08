@@ -1049,6 +1049,27 @@ def is_telegram_compatible_video(metadata: VideoMetadata) -> bool:
     return not _is_he_aac(metadata)
 
 
+def _instagram_music_offset_ms(item: dict) -> int:
+    """Offset into a licensed-music asset where this Reel's clip actually
+    starts. Instagram trims trending sounds to a snippet rather than always
+    using the track from 0:00 — music_consumption_info on the post carries
+    that trim point. Muxing the full track back in from its own start makes
+    the audio play noticeably late/out of sync with the video."""
+    for scope in (item.get("clips_metadata"), item.get("music_metadata")):
+        if not isinstance(scope, dict):
+            continue
+        music_info = scope.get("music_info")
+        if not isinstance(music_info, dict):
+            continue
+        consumption = music_info.get("music_consumption_info")
+        if not isinstance(consumption, dict):
+            continue
+        offset = consumption.get("audio_asset_start_time_in_ms")
+        if isinstance(offset, (int, float)) and offset > 0:
+            return int(offset)
+    return 0
+
+
 def _mux_instagram_original_audio(
     video_path: Path,
     url: str,
@@ -1066,6 +1087,9 @@ def _mux_instagram_original_audio(
     ffmpeg_path = get_ffmpeg_path()
     if not ffmpeg_path or not cookies_file:
         return False
+
+    item = fetch_instagram_media_info(url, cookies_file=cookies_file)
+    offset_ms = _instagram_music_offset_ms(item) if item else 0
 
     audio_files = download_instagram_attached_audio(
         url, video_path.parent, cookies_file=cookies_file, log=log
@@ -1086,6 +1110,11 @@ def _mux_instagram_original_audio(
         "1",
         "-i",
         str(video_path),
+    ]
+    if offset_ms:
+        log(f"Аудио-трек обрезан у поста с {offset_ms} ms — сдвигаю при вклейке.")
+        command += ["-ss", f"{offset_ms / 1000:.3f}"]
+    command += [
         "-i",
         str(audio_path),
         "-map",
