@@ -423,15 +423,18 @@ def cookies_mtime_iso(path: str | Path | None) -> str | None:
 
 
 def ensure_cookie_pool() -> None:
-    """Create pool dir and migrate legacy INSTAGRAM_COOKIES_FILE into slot 1."""
-    COOKIES_DIR.mkdir(parents=True, exist_ok=True)
-    slot1 = COOKIES_DIR / "1.txt"
-    if slot1.exists():
+    """Create the pool dir and, only the very first time it's created, migrate
+    a legacy INSTAGRAM_COOKIES_FILE into slot 1. Gating on the directory
+    (not just slot 1) matters once /cookies can delete slots: emptying slot 1
+    that way must not resurrect a stale legacy file on the next restart."""
+    if COOKIES_DIR.exists():
         return
-    if COOKIES_FILE:
-        legacy = Path(COOKIES_FILE).expanduser()
-        if legacy.exists() and cookies_file_has_sessionid(legacy):
-            slot1.write_bytes(legacy.read_bytes())
+    COOKIES_DIR.mkdir(parents=True)
+    if not COOKIES_FILE:
+        return
+    legacy = Path(COOKIES_FILE).expanduser()
+    if legacy.exists() and cookies_file_has_sessionid(legacy):
+        (COOKIES_DIR / "1.txt").write_bytes(legacy.read_bytes())
 
 
 def cookie_slot_paths() -> list[Path]:
