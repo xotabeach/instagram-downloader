@@ -206,6 +206,113 @@ ssh crimeatrip-test 'cd /opt/instagram-downloader && .venv/bin/python -m yt_dlp 
 
 ---
 
+## Локальный Bot API сервер (снятие лимита 50 MB)
+
+Облачный `api.telegram.org` не даёт боту отправлять файлы больше 50 MB — это
+ограничение самого облачного Bot API, а не нашего кода. Обход — поднять
+**свой** Bot API сервер (`telegram-bot-api`, официальный TDLib-демон) рядом
+с ботом и общаться с ним по `localhost`. Локальный сервер поднимает лимит
+до ~2000 MB и в режиме `--local` отдаёт/принимает файлы путями на диске
+вместо перекачки байт через себя — это и быстрее, и не жрёт лишнюю память
+на нашей стороне.
+
+⚠️ На `crimeatrip-test` всего ~480 MB RAM и 1 CPU, и там же крутится Docker
+CrimeaTrip. Свободной памяти по факту почти нет (см. `free -h`), запас идёт
+в своп. `telegram-bot-api` сам по себе лёгкий (десятки MB в простое), но при
+закачке большого видео в Telegram может кратковременно раздуться. Если после
+включения бот/сервисы начнут падать по OOM — это первое, что стоит
+проверить (`journalctl -k | grep -i oom`, `docker stats`).
+
+### 1) Получить api_id / api_hash
+
+Это привязано к телефону — сделать может только сам пользователь:
+
+1. Зайти на https://my.telegram.org/apps под любым Telegram-аккаунтом.
+2. Войти по номеру телефона (придёт код в Telegram).
+3. Заполнить форму «Create new application» (App title / Short name — что
+   угодно, например `instagram-downloader-bot`).
+4. Скопировать **App api_id** и **App api_hash** — они нужны один раз, при
+   первом запуске сервера.
+
+### 2) Поднять `telegram-bot-api` в Docker
+
+Используем неофициальный, но широко используемый образ `aiogram/telegram-bot-api`
+(собран из официального `tdlib/telegram-bot-api`, ~19 MB, мультиарх).
+
+```bash
+ssh crimeatrip-test 'bash -s' <<'REMOTE'
+set -e
+mkdir -p /var/lib/telegram-bot-api
+docker rm -f telegram-bot-api 2>/dev/null || true
+docker run -d \
+  --name telegram-bot-api \
+  --restart unless-stopped \
+  --memory=200m --memory-swap=500m \
+  -p 127.0.0.1:8081:8081 \
+  -v /var/lib/telegram-bot-api:/var/lib/telegram-bot-api \
+  -v /tmp:/tmp \
+  -e TELEGRAM_API_ID='ВСТАВЬ_API_ID' \
+  -e TELEGRAM_API_HASH='ВСТАВЬ_API_HASH' \
+  -e TELEGRAM_LOCAL=1 \
+  aiogram/telegram-bot-api:latest
+docker logs telegram-bot-api --tail 20
+REMOTE
+```
+
+Важно:
+
+- `-v /tmp:/tmp` — бот качает медиа во временные папки под `/tmp`
+  (`tempfile.mkdtemp`, `TMPDIR=/tmp` в systemd unit). Путь в контейнере
+  должен совпадать с путём на хосте один в один, иначе сервер не найдёт
+  файл при отправке.
+- `-v /var/lib/telegram-bot-api:/var/lib/telegram-bot-api` — то же самое,
+  но для входящих файлов (`get_file`): сервер отдаёт готовый путь на диске,
+  и он должен быть виден боту по тому же пути на хосте. Именно поэтому это
+  bind-mount конкретной директории, а не именованный docker-volume.
+  Не открываем `-p` наружу — только `127.0.0.1:8081`, порт не должен
+  торчать в интернет.
+- `--memory`/`--memory-swap` — защита от того, что закачка одного большого
+  видео положит весь VPS по OOM.
+
+Внутри контейнера `telegram-bot-api` сам понижает привилегии до отдельного
+uid — поэтому код бота (`_media_handle` в `instagram_telegram_bot.py`)
+перед отправкой делает `chmod` на скачанный файл и его папку, иначе сервер
+не сможет их прочитать.
+
+### 3) Включить в `.env` бота
+
+```bash
+ssh crimeatrip-test 'nano /opt/instagram-downloader/instagram_telegram_bot.env'
+```
+
+Добавить:
+
+```env
+TELEGRAM_LOCAL_MODE=true
+TELEGRAM_API_BASE_URL=http://127.0.0.1:8081/bot
+TELEGRAM_API_BASE_FILE_URL=http://127.0.0.1:8081/file/bot
+```
+
+```bash
+ssh crimeatrip-test 'systemctl restart instagram-telegram-bot && journalctl -u instagram-telegram-bot -n 20 --no-pager'
+```
+
+В логе при старте должна появиться строка `Bot API: local (...)`.
+
+### Проверка
+
+Пришли боту видео больше 50 MB (например, YouTube в 1080p) — раньше бот
+предлагал сжать, теперь должен просто прислать файл целиком, до ~2 GB.
+
+### Откат
+
+Удалить/закомментировать три строки `TELEGRAM_*` из `.env` и
+`systemctl restart instagram-telegram-bot` — бот вернётся на облачный API и
+лимит 50 MB. Сам контейнер можно оставить работать (не мешает) или
+`docker rm -f telegram-bot-api`.
+
+---
+
 ## Обновить cookies Instagram / YouTube
 
 Cookies протухают. Экспортируй свежий `cookies.txt` локально, затем:

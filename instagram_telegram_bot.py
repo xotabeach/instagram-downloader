@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import time
 import traceback
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,7 +56,6 @@ from instagram_core import (
     probe_video_metadata,
 )
 
-MAX_UPLOAD_BYTES = TELEGRAM_MAX_UPLOAD_BYTES
 MEDIA_GROUP_LIMIT = 10
 JOB_TTL_SECONDS = 30 * 60
 PROGRESS_INTERVAL_SECONDS = 10
@@ -123,6 +123,16 @@ AUTH_ANSWER = (
     or "xotabeach"
 )
 CATEGORY_B_JOKES = load_category_b_jokes()
+
+# A local Bot API server (see DEPLOY.md) drops the 50 MB cloud upload limit to
+# ~2000 MB and lets us hand it file paths instead of uploading bytes ourselves.
+TELEGRAM_LOCAL_MODE = env_bool("TELEGRAM_LOCAL_MODE", False)
+TELEGRAM_API_BASE_URL = os.getenv("TELEGRAM_API_BASE_URL", "").strip() or None
+TELEGRAM_API_BASE_FILE_URL = os.getenv("TELEGRAM_API_BASE_FILE_URL", "").strip() or None
+MAX_UPLOAD_BYTES = env_int(
+    "TELEGRAM_MAX_UPLOAD_MB",
+    2000 if TELEGRAM_LOCAL_MODE else TELEGRAM_MAX_UPLOAD_BYTES // (1024 * 1024),
+) * 1024 * 1024
 
 # Users who already saw the question and are waiting for the answer (in-memory).
 _pending_auth: set[int] = set()
@@ -790,7 +800,7 @@ def welcome_text() -> str:
         "Я скачаю и отправлю медиа как есть:\n"
         "• YouTube — выбор качества (1080p/720p/480p/360p), до 20 минут\n"
         "• видео — в исходном разрешении и соотношении сторон\n"
-        "• если файл больше ~50 MB — предложу сжать\n"
+        f"• если файл больше ~{MAX_UPLOAD_BYTES // (1024 * 1024)} MB — предложу сжать\n"
         "• фото — превью в чате (для оригинала без сжатия: TELEGRAM_PHOTO_PREVIEW=false)\n"
         "• карусель — фото листаются вместе (до 10 в сообщении)\n"
         "После видео — случайный анекдот категории Б.\n"
@@ -903,12 +913,30 @@ async def handle_cookies_document(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
+@contextmanager
+def _media_handle(file_path: Path):
+    """In local Bot API mode, hand over the path so the API server reads the
+    file itself instead of us uploading its bytes through Python."""
+    if TELEGRAM_LOCAL_MODE:
+        # The Bot API server reads this path itself from inside its own
+        # container, under its own uid — make sure it's actually allowed to.
+        file_path.chmod(0o644)
+        file_path.parent.chmod(0o755)
+        yield str(file_path)
+        return
+    handle = file_path.open("rb")
+    try:
+        yield handle
+    finally:
+        handle.close()
+
+
 async def send_media(message, file_path: Path) -> None:
     size = file_path.stat().st_size
     if size > MAX_UPLOAD_BYTES:
         await message.reply_text(
             f"Файл слишком большой для Telegram Bot API ({size / (1024 * 1024):.1f} MB): "
-            f"{file_path.name}\nЛимит ~50 MB."
+            f"{file_path.name}\nЛимит ~{MAX_UPLOAD_BYTES // (1024 * 1024)} MB."
         )
         return
 
@@ -918,7 +946,7 @@ async def send_media(message, file_path: Path) -> None:
     if is_video(file_path):
         if SEND_PREVIEW or not SEND_DOCUMENT:
             metadata = await asyncio.to_thread(probe_video_metadata, file_path)
-            with file_path.open("rb") as media_file:
+            with _media_handle(file_path) as media_file:
                 await message.reply_video(
                     video=media_file,
                     width=metadata.width,
@@ -928,7 +956,7 @@ async def send_media(message, file_path: Path) -> None:
                 )
 
         if SEND_DOCUMENT:
-            with file_path.open("rb") as document_file:
+            with _media_handle(file_path) as document_file:
                 await message.reply_document(
                     document=document_file,
                     filename=file_path.name,
@@ -937,7 +965,7 @@ async def send_media(message, file_path: Path) -> None:
         return
 
     if is_image(file_path):
-        with file_path.open("rb") as media_file:
+        with _media_handle(file_path) as media_file:
             if PHOTO_PREVIEW and (SEND_PREVIEW or not SEND_DOCUMENT):
                 await message.reply_photo(photo=media_file)
             else:
@@ -950,7 +978,7 @@ async def send_media(message, file_path: Path) -> None:
 
     if is_audio_only(file_path):
         metadata = await asyncio.to_thread(probe_video_metadata, file_path)
-        with file_path.open("rb") as media_file:
+        with _media_handle(file_path) as media_file:
             await message.reply_audio(
                 audio=media_file,
                 duration=metadata.duration,
@@ -958,7 +986,7 @@ async def send_media(message, file_path: Path) -> None:
             )
         return
 
-    with file_path.open("rb") as media_file:
+    with _media_handle(file_path) as media_file:
         await message.reply_document(
             document=media_file,
             filename=file_path.name,
@@ -978,8 +1006,8 @@ async def send_photos(message, file_paths: list[Path]) -> None:
             await send_media(message, chunk[0])
             continue
 
-        handles = [path.open("rb") for path in chunk]
-        try:
+        with ExitStack() as stack:
+            handles = [stack.enter_context(_media_handle(path)) for path in chunk]
             if send_as_document:
                 media = [
                     InputMediaDocument(media=handle, filename=path.name)
@@ -988,9 +1016,6 @@ async def send_photos(message, file_paths: list[Path]) -> None:
             else:
                 media = [InputMediaPhoto(media=handle) for handle in handles]
             await message.reply_media_group(media=media)
-        finally:
-            for handle in handles:
-                handle.close()
 
 
 async def send_random_category_b_joke(message) -> None:
@@ -1525,7 +1550,22 @@ def main() -> None:
         )
         YOUTUBE_COOKIES_FILE = None
 
-    app = Application.builder().token(token).build()
+    builder = Application.builder().token(token)
+    if TELEGRAM_API_BASE_URL:
+        builder = builder.base_url(TELEGRAM_API_BASE_URL)
+    if TELEGRAM_API_BASE_FILE_URL:
+        builder = builder.base_file_url(TELEGRAM_API_BASE_FILE_URL)
+    if TELEGRAM_LOCAL_MODE:
+        # Even reading straight off disk, the local API server still has to push
+        # large files out to Telegram itself — the default 20s media timeout is
+        # nowhere near enough for a few-hundred-MB video on this VPS's uplink.
+        builder = (
+            builder.local_mode(True)
+            .read_timeout(300)
+            .write_timeout(300)
+            .media_write_timeout(1200)
+        )
+    app = builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
@@ -1535,6 +1575,10 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     print("Instagram Telegram bot started.")
+    print(
+        f"Bot API: {'local (' + TELEGRAM_API_BASE_URL + ')' if TELEGRAM_API_BASE_URL else 'cloud'}, "
+        f"upload limit: {MAX_UPLOAD_BYTES // (1024 * 1024)} MB"
+    )
     print(f"Instagram cookies browser: {COOKIES_BROWSER or 'нет'}")
     print(f"Instagram cookies pool: {COOKIES_DIR} ({len(alive_slots)}/{COOKIE_SLOTS} alive)")
     print(
