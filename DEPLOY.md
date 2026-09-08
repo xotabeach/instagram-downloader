@@ -167,6 +167,64 @@ rsync -avz \
 Для бота задан лимит памяти и CPU через systemd override. Это не останавливает
 Docker-контейнеры и не перезапускает Docker Compose.
 
+### ⚠️ `/usr/local/sbin/deploy-instagram-bot` не в git — не забудь про исключения
+
+Этот скрипт живёт только на сервере (root-owned, не в репозитории). До 2026-09-08
+в нём не хватало `--exclude 'instagram_cookies'` и `--exclude 'cookies_state.json'`
+во втором `rsync --delete` (`release/` → `/opt/instagram-downloader/`) — из-за
+этого **каждый push в main грохал весь пул Instagram cookies и его state**
+(первый rsync, GitHub → `release/`, эти пути и так исключает — но раз их нет
+в `release/`, второй rsync с `--delete` считал их «лишними» на сервере и удалял).
+Похоже, из-за этого куки периодически «протухали» без видимой причины.
+
+Актуальная версия (уже применена на `crimeatrip-test`, бэкап лежит в
+`/root/deploy-instagram-bot.bak-*`):
+
+```sh
+#!/bin/sh
+set -eu
+
+source_dir=/home/instagram-deploy/release
+target_dir=/opt/instagram-downloader
+
+if [ ! -f "$source_dir/instagram_telegram_bot.py" ] || [ ! -f "$source_dir/requirements.txt" ]; then
+    echo "Release is incomplete" >&2
+    exit 1
+fi
+
+requirements_changed=false
+if ! cmp -s "$source_dir/requirements.txt" "$target_dir/requirements.txt"; then
+    requirements_changed=true
+fi
+
+rsync -a --delete --chown=root:root \
+    --exclude '.git' \
+    --exclude '.github' \
+    --exclude '.venv' \
+    --exclude '__pycache__' \
+    --exclude 'instagram_telegram_bot.env' \
+    --exclude 'instagram_cookies.txt' \
+    --exclude 'instagram_cookies' \
+    --exclude 'youtube_cookies.txt' \
+    --exclude 'authorized_users.json' \
+    --exclude 'bot_stats.json' \
+    --exclude 'cookies_state.json' \
+    --exclude '*.mp4' \
+    "$source_dir/" "$target_dir/"
+
+if [ "$requirements_changed" = true ]; then
+    nice -n 10 /root/.local/bin/uv pip install \
+        --python "$target_dir/.venv/bin/python" \
+        -r "$target_dir/requirements.txt"
+fi
+
+systemctl restart instagram-telegram-bot.service
+systemctl is-active --quiet instagram-telegram-bot.service
+```
+
+Если сервер когда-нибудь поднимается с нуля — создай этот файл заново с
+именно этим содержимым, `chmod 755`, и не забудь оба новых `--exclude`.
+
 ---
 
 ## JS-рантайм для YouTube (deno)
