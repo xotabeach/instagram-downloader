@@ -1049,7 +1049,83 @@ def is_telegram_compatible_video(metadata: VideoMetadata) -> bool:
     return not _is_he_aac(metadata)
 
 
-def ensure_telegram_compatible_video(file_path: Path, log: LogFn = _noop_log) -> None:
+def _mux_instagram_original_audio(
+    video_path: Path,
+    url: str,
+    *,
+    cookies_file: str | Path | None,
+    log: LogFn,
+) -> bool:
+    """Recover a muted Instagram video's soundtrack and mux it back in.
+
+    Instagram exposes a Reel's own audio (spoken/ambient sound, or an added
+    music track) as post metadata separately from the muted DASH video that
+    yt-dlp sometimes gets for guest/half-authenticated sessions — the same
+    'original sound' info the carousel audio fallback already reads.
+    """
+    ffmpeg_path = get_ffmpeg_path()
+    if not ffmpeg_path or not cookies_file:
+        return False
+
+    audio_files = download_instagram_attached_audio(
+        url, video_path.parent, cookies_file=cookies_file, log=log
+    )
+    if not audio_files:
+        return False
+
+    audio_path = audio_files[0]
+    temp_path = video_path.with_name(video_path.stem + ".withaudio.mp4")
+    command = [
+        ffmpeg_path,
+        "-y",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-threads",
+        "1",
+        "-i",
+        str(video_path),
+        "-i",
+        str(audio_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-ac",
+        "2",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        str(temp_path),
+    ]
+    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    for extra in audio_files:
+        extra.unlink(missing_ok=True)
+
+    if result.returncode or not temp_path.exists():
+        log(f"Не удалось смешать восстановленное аудио: {(result.stdout or '')[-400:]}")
+        temp_path.unlink(missing_ok=True)
+        return False
+
+    temp_path.replace(video_path)
+    log(f"Звук восстановлен из оригинальной дорожки поста: {video_path.name}")
+    return True
+
+
+def ensure_telegram_compatible_video(
+    file_path: Path,
+    log: LogFn = _noop_log,
+    *,
+    url: str | None = None,
+    cookies_file: str | Path | None = None,
+) -> None:
     """Fix HE-AAC / VP9 for Telegram without burning the VPS on mute files."""
     ffmpeg_path = get_ffmpeg_path()
     if not ffmpeg_path:
@@ -1060,13 +1136,25 @@ def ensure_telegram_compatible_video(file_path: Path, log: LogFn = _noop_log) ->
         return
 
     if not metadata.has_audio:
-        # Full H.264 re-encode cannot invent a soundtrack and used to stall the
-        # bot for minutes on mute Instagram DASH. Skip and keep the download fast.
-        log(
-            f"В {file_path.name} нет аудиодорожки — пропускаю перекодирование. "
-            "Обычно помогает свежий instagram_cookies.txt с sessionid."
-        )
-        return
+        recovered = False
+        if url and is_instagram_url(url):
+            try:
+                recovered = _mux_instagram_original_audio(
+                    file_path, url, cookies_file=cookies_file, log=log
+                )
+            except Exception as exc:
+                log(f"Не удалось восстановить звук: {exc}")
+        if not recovered:
+            # Full H.264 re-encode cannot invent a soundtrack and used to stall the
+            # bot for minutes on mute Instagram DASH. Skip and keep the download fast.
+            log(
+                f"В {file_path.name} нет аудиодорожки — пропускаю перекодирование. "
+                "Обычно помогает свежий instagram_cookies.txt с sessionid."
+            )
+            return
+        metadata = probe_video_metadata(file_path)
+        if is_telegram_compatible_video(metadata):
+            return
 
     temp_path = file_path.with_name(file_path.stem + ".tgplay.mp4")
     if _is_h264(metadata):
@@ -1896,7 +1984,9 @@ def download_instagram_media(
         prepared_files: list[Path] = []
         for file_path in new_files:
             if is_video(file_path):
-                ensure_telegram_compatible_video(file_path, emit)
+                ensure_telegram_compatible_video(
+                    file_path, emit, url=url, cookies_file=effective_cookies_file
+                )
                 prepared_files.append(file_path)
             elif is_audio_only(file_path):
                 prepared_files.append(prepare_telegram_audio(file_path, emit))
