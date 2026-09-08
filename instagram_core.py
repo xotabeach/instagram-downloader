@@ -31,6 +31,12 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
 INSTAGRAM_PAGE_USER_AGENT = "Mozilla/5.0"
+# Desktop TikTok pages often ship a JS challenge without imagePost;
+# the mobile web view still embeds the slideshow in rehydration JSON.
+TIKTOK_PAGE_USER_AGENT = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1"
+)
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
@@ -178,6 +184,21 @@ def is_instagram_url(url: str) -> bool:
 
 def is_tiktok_url(url: str) -> bool:
     return "tiktok.com" in urlparse(url).netloc.lower()
+
+
+def is_tiktok_photo_url(url: str) -> bool:
+    if not is_tiktok_url(url):
+        return False
+    return "/photo/" in urlparse(url).path.lower()
+
+
+def tiktok_needs_photo_fallback(url: str, log_text: str) -> bool:
+    """yt-dlp has no extractor for TikTok /photo/ slideshows (including vt/vm redirects)."""
+    if not is_tiktok_url(url):
+        return False
+    if is_tiktok_photo_url(url):
+        return True
+    return bool(re.search(r"tiktok\.com/[^\s\"']*/photo/\d+", log_text, flags=re.IGNORECASE))
 
 
 def is_youtube_url(url: str) -> bool:
@@ -579,6 +600,105 @@ def download_instagram_photos(
         download_file(photo_url, destination, url, cookie_header=cookie_header)
         downloaded_count += 1
         log(f"Фото скачано: {destination}")
+
+    return downloaded_count
+
+
+def _tiktok_item_from_rehydration(page_html: str) -> dict | None:
+    match = re.search(
+        r'<script id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>(.*?)</script>',
+        page_html,
+        flags=re.DOTALL,
+    )
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    scope = payload.get("__DEFAULT_SCOPE__") or payload
+    if not isinstance(scope, dict):
+        return None
+    for key in ("webapp.video-detail", "webapp.reflow.video.detail"):
+        detail = scope.get(key)
+        if not isinstance(detail, dict):
+            continue
+        item = (detail.get("itemInfo") or {}).get("itemStruct")
+        if isinstance(item, dict):
+            return item
+    return None
+
+
+def find_tiktok_photo_urls(item: dict) -> list[str]:
+    images = ((item.get("imagePost") or {}).get("images")) or []
+    urls: list[str] = []
+    for image in images:
+        url_list = ((image.get("imageURL") or {}).get("urlList")) or []
+        if url_list and isinstance(url_list[0], str):
+            urls.append(url_list[0])
+    return urls
+
+
+def find_tiktok_audio_url(item: dict) -> str | None:
+    music = item.get("music") or {}
+    play_url = music.get("playUrl")
+    if isinstance(play_url, str) and play_url:
+        return play_url
+    for alt in music.get("playUrlList") or []:
+        if isinstance(alt, str) and alt:
+            return alt
+    return None
+
+
+def download_tiktok_photos(
+    url: str,
+    output_path: Path,
+    log: LogFn = _noop_log,
+) -> int:
+    """Download a TikTok photo slideshow (and attached music) from the post page."""
+    headers = {
+        "User-Agent": TIKTOK_PAGE_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.tiktok.com/",
+    }
+    request = Request(url, headers=headers)
+    with urlopen(request, timeout=30, context=ssl._create_unverified_context()) as response:
+        page_html = response.read().decode("utf-8", "replace")
+        page_url = response.geturl() or url
+
+    item = _tiktok_item_from_rehydration(page_html)
+    if not item:
+        return 0
+
+    photo_urls = find_tiktok_photo_urls(item)
+    audio_url = find_tiktok_audio_url(item)
+    if not photo_urls and not audio_url:
+        return 0
+
+    post_id = str(item.get("id") or "tiktok")
+    output_path.mkdir(parents=True, exist_ok=True)
+    referer = page_url if "tiktok.com" in page_url else "https://www.tiktok.com/"
+    downloaded_count = 0
+
+    for index, photo_url in enumerate(photo_urls, start=1):
+        extension = extension_for_instagram_photo_url(photo_url)
+        destination = output_path / f"{post_id}_{index:02d}.{extension}"
+        if destination.exists():
+            log(f"Фото уже есть: {destination}")
+            continue
+        download_file(photo_url, destination, referer)
+        downloaded_count += 1
+        log(f"Фото скачано: {destination}")
+
+    if audio_url:
+        destination = output_path / f"{post_id}_audio.m4a"
+        if destination.exists():
+            log(f"Аудио уже есть: {destination}")
+        else:
+            download_file(audio_url, destination, referer)
+            downloaded_count += 1
+            log(f"Аудио скачано: {destination}")
 
     return downloaded_count
 
@@ -1647,30 +1767,43 @@ def download_instagram_media(
         client_attempts = YOUTUBE_PLAYER_CLIENT_ATTEMPTS if youtube else (None,)
         result_code = 1
         files_after_ydl: list[Path] = []
+        skip_ydl = is_tiktok_photo_url(url)
+        force_tiktok_photos = skip_ydl
 
-        for index, clients in enumerate(client_attempts):
-            if youtube and clients:
-                emit(f"YouTube-клиент: {', '.join(clients)}")
-            options = build_ydl_options(
-                output_path,
-                cookies_browser=effective_cookies_browser,
-                cookies_file=effective_cookies_file,
-                log=emit,
-                max_height=max_height,
-                noplaylist=youtube,
-                prefer_avc=youtube,
-                prefer_progressive=is_instagram_url(url),
-                extractor_args=youtube_extractor_args(clients) if clients else None,
-            )
-            with YoutubeDL(options) as ydl:
-                result_code = ydl.download([url])
-            files_after_ydl = sorted(get_media_files(output_path) - existing_media_files)
-            if files_after_ydl or not youtube:
-                break
-            if index + 1 < len(client_attempts):
-                emit("YouTube отклонил поток (часто 403). Пробую другой клиент...")
-                for leftover in get_media_files(output_path) - existing_media_files:
-                    leftover.unlink(missing_ok=True)
+        if skip_ydl:
+            emit("TikTok фото-пост: yt-dlp не умеет /photo/, качаю слайдшоу напрямую.")
+        else:
+            try:
+                for index, clients in enumerate(client_attempts):
+                    if youtube and clients:
+                        emit(f"YouTube-клиент: {', '.join(clients)}")
+                    options = build_ydl_options(
+                        output_path,
+                        cookies_browser=effective_cookies_browser,
+                        cookies_file=effective_cookies_file,
+                        log=emit,
+                        max_height=max_height,
+                        noplaylist=youtube,
+                        prefer_avc=youtube,
+                        prefer_progressive=is_instagram_url(url),
+                        extractor_args=youtube_extractor_args(clients) if clients else None,
+                    )
+                    with YoutubeDL(options) as ydl:
+                        result_code = ydl.download([url])
+                    files_after_ydl = sorted(get_media_files(output_path) - existing_media_files)
+                    if files_after_ydl or not youtube:
+                        break
+                    if index + 1 < len(client_attempts):
+                        emit("YouTube отклонил поток (часто 403). Пробую другой клиент...")
+                        for leftover in get_media_files(output_path) - existing_media_files:
+                            leftover.unlink(missing_ok=True)
+            except DownloadError as e:
+                if tiktok_needs_photo_fallback(url, "\n".join(messages) + "\n" + str(e)):
+                    emit("yt-dlp не скачал TikTok /photo/, пробую слайдшоу.")
+                    force_tiktok_photos = True
+                    result_code = 1
+                else:
+                    raise
 
         if is_instagram_url(url):
             photo_mode = instagram_photo_fallback_mode(result_code, files_after_ydl)
@@ -1742,6 +1875,21 @@ def download_instagram_media(
             else:
                 emit("Фото-fallback пропущен: видео уже скачано без пропусков.")
 
+        if force_tiktok_photos or tiktok_needs_photo_fallback(url, "\n".join(messages)):
+            already_has_images = any(
+                is_image(path)
+                for path in (get_media_files(output_path) - existing_media_files)
+            )
+            if not already_has_images:
+                try:
+                    photo_count = download_tiktok_photos(url, output_path, emit)
+                    if photo_count:
+                        emit(f"TikTok слайдшоу сохранено: {photo_count}")
+                    else:
+                        emit("Не удалось разобрать фото TikTok со страницы.")
+                except Exception as photo_error:
+                    emit(f"Не удалось скачать TikTok фото: {photo_error}")
+
         new_files = filter_video_thumbnails(
             sorted(get_media_files(output_path) - existing_media_files)
         )
@@ -1757,7 +1905,7 @@ def download_instagram_media(
         new_files = sort_files_for_delivery(prepared_files)
         partial = bool(result_code) and bool(new_files)
         # yt-dlp exits non-zero on photo-only posts even when photos downloaded fine.
-        if partial and is_instagram_url(url) and new_files and all(
+        if partial and (is_instagram_url(url) or is_tiktok_url(url)) and new_files and all(
             is_image(path) or is_audio_only(path) for path in new_files
         ):
             partial = False
